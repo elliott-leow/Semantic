@@ -7,6 +7,19 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <sys/sysctl.h>
+#if defined(__ARM_FEATURE_DOTPROD)
+#include <arm_neon.h>
+#endif
+
+int sb_threads(void) {
+    static int n = [] {
+        int v = 0;
+        size_t len = sizeof(v);
+        return sysctlbyname("hw.perflevel0.physicalcpu", &v, &len, nullptr, 0) == 0 && v > 0 ? v : 4;
+    }();
+    return n;
+}
 
 struct sb_ctx {
     llama_model *     model = nullptr;
@@ -42,8 +55,8 @@ sb_ctx * sb_init(const char * model_path, const char * mmproj_path, int n_ctx, i
     cp.n_seq_max  = 1;
     cp.embeddings = true;
     cp.no_perf    = true;
-    cp.n_threads       = 4;
-    cp.n_threads_batch = 4;
+    cp.n_threads       = sb_threads();
+    cp.n_threads_batch = sb_threads();
     c->ctx = llama_init_from_model(c->model, cp);
     if (!c->ctx) { sb_free(c); return nullptr; }
     c->batch = llama_batch_ext_init(c->ctx);
@@ -52,7 +65,7 @@ sb_ctx * sb_init(const char * model_path, const char * mmproj_path, int n_ctx, i
         mtmd_context_params mm = mtmd_context_params_default();
         mm.use_gpu       = use_gpu != 0;
         mm.print_timings = false;
-        mm.n_threads     = 4;
+        mm.n_threads     = sb_threads();
         mm.warmup        = false;
         c->mctx = mtmd_init_from_file(mmproj_path, c->model, mm);
         if (!c->mctx) { sb_free(c); return nullptr; }
@@ -178,7 +191,7 @@ int sb_embed_audio(sb_ctx * c, const float * pcm16k, size_t n_samples, float * o
     return embed_media(c, mtmd_bitmap_init_from_audio(n_samples, pcm16k), out);
 }
 
-void sb_scan_i8(const float * q, const int8_t * docs, size_t n, float * out) {
+void sb_scan_i8_ref(const float * q, const int8_t * docs, size_t n, float * out) {
     for (size_t r = 0; r < n; r++) {
         const int8_t * d = docs + r * SB_DIM;
         float s = 0;
@@ -187,11 +200,85 @@ void sb_scan_i8(const float * q, const int8_t * docs, size_t n, float * out) {
     }
 }
 
+void sb_scan_i8(const float * q, const int8_t * docs, size_t n, float * out) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    float m = 0;
+    for (int i = 0; i < SB_DIM; i++) m = std::fmax(m, std::fabs(q[i]));
+    if (!(m > 0) || !std::isfinite(m)) { sb_scan_i8_ref(q, docs, n, out); return; }
+    // The query as two int8 digits, q*s = hi + lo/254 (to within 1/508), so integer dot products
+    // reproduce the float scores to about 1e-5 of their range.
+    const float s = 127.0f / m;
+    alignas(16) int8_t hi[SB_DIM], lo[SB_DIM];
+    for (int i = 0; i < SB_DIM; i++) {
+        float v = q[i] * s, h = std::round(v);
+        if (std::isnan(v)) { sb_scan_i8_ref(q, docs, n, out); return; }
+        hi[i] = (int8_t) h;
+        lo[i] = (int8_t) std::lround((v - h) * 254.0f);
+    }
+    const float a = 1.0f / s, b = a / 254.0f;
+    for (size_t r = 0; r < n; r++) {
+        const int8_t * d = docs + r * SB_DIM;
+        int32x4_t h0 = vdupq_n_s32(0), h1 = h0, l0 = h0, l1 = h0;
+        for (int i = 0; i < SB_DIM; i += 32) {
+            int8x16_t d0 = vld1q_s8(d + i), d1 = vld1q_s8(d + i + 16);
+            h0 = vdotq_s32(h0, vld1q_s8(hi + i), d0);
+            h1 = vdotq_s32(h1, vld1q_s8(hi + i + 16), d1);
+            l0 = vdotq_s32(l0, vld1q_s8(lo + i), d0);
+            l1 = vdotq_s32(l1, vld1q_s8(lo + i + 16), d1);
+        }
+        out[r] = a * (float) vaddvq_s32(vaddq_s32(h0, h1)) + b * (float) vaddvq_s32(vaddq_s32(l0, l1));
+    }
+#else
+    sb_scan_i8_ref(q, docs, n, out);
+#endif
+}
+
+void sb_norms_i8(const int8_t * docs, size_t n, float * out) {
+    for (size_t r = 0; r < n; r++) {
+        const int8_t * d = docs + r * SB_DIM;
+#if defined(__ARM_FEATURE_DOTPROD)
+        int32x4_t acc = vdupq_n_s32(0);
+        for (int i = 0; i < SB_DIM; i += 16) { int8x16_t v = vld1q_s8(d + i); acc = vdotq_s32(acc, v, v); }
+        int32_t sq = vaddvq_s32(acc);
+#else
+        int32_t sq = 0;
+        for (int i = 0; i < SB_DIM; i++) sq += (int32_t) d[i] * d[i];
+#endif
+        out[r] = std::sqrt((float) sq);
+    }
+}
+
 struct sb_llm {
     llama_model *   model = nullptr;
     llama_context * ctx   = nullptr;
     int             n_ctx = 0;
+    // a decoded prompt prefix: its tokens and the sequence state they leave behind
+    std::vector<llama_token> prefix;
+    std::vector<uint8_t>     state;
 };
+
+static int tokenize(sb_llm * l, const char * text, std::vector<llama_token> & toks) {
+    toks.resize(l->n_ctx);
+    int n = llama_tokenize(llama_model_get_vocab(l->model), text, (int) strlen(text), toks.data(), (int) toks.size(), true, true);
+    toks.resize(n > 0 ? n : 0);
+    return n;
+}
+
+int sb_llm_cache_prefix(sb_llm * l, const char * prefix) {
+    std::vector<llama_token> toks;
+    int n = tokenize(l, prefix, toks);
+    if (n <= 0 || n >= l->n_ctx) return -1;
+    llama_memory_clear(llama_get_memory(l->ctx), true);
+    l->prefix.clear();
+    l->state.clear();
+    if (llama_decode(l->ctx, llama_batch_get_one(toks.data(), n)) != 0) return -3;
+    // a state copy rather than a trimmed cache: hybrid models cannot drop part of a recurrent state
+    size_t size = llama_state_seq_get_size(l->ctx, 0);
+    l->state.resize(size);
+    if (size == 0 || llama_state_seq_get_data(l->ctx, l->state.data(), size, 0) != size) { l->state.clear(); return -4; }
+    l->prefix = toks;
+    return n;
+}
 
 sb_llm * sb_llm_init(const char * model_path, int n_ctx) {
     llama_log_set(quiet_log, nullptr);
@@ -206,8 +293,8 @@ sb_llm * sb_llm_init(const char * model_path, int n_ctx) {
     cp.n_ctx   = n_ctx;
     cp.n_batch = n_ctx;
     cp.no_perf = true;
-    cp.n_threads       = 4;
-    cp.n_threads_batch = 4;
+    cp.n_threads       = sb_threads();
+    cp.n_threads_batch = sb_threads();
     l->ctx = llama_init_from_model(l->model, cp);
     if (!l->ctx) { sb_llm_free(l); return nullptr; }
     return l;
@@ -222,8 +309,8 @@ void sb_llm_free(sb_llm * l) {
 
 int sb_llm_generate(sb_llm * l, const char * prompt, const char * grammar, int max_tokens, char * out, int out_len) {
     const llama_vocab * vocab = llama_model_get_vocab(l->model);
-    std::vector<llama_token> toks(l->n_ctx);
-    int n = llama_tokenize(vocab, prompt, (int) strlen(prompt), toks.data(), (int) toks.size(), true, true);
+    std::vector<llama_token> toks;
+    int n = tokenize(l, prompt, toks);
     if (n <= 0 || n + max_tokens > l->n_ctx) return -1;
 
     llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -235,8 +322,14 @@ int sb_llm_generate(sb_llm * l, const char * prompt, const char * grammar, int m
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
     llama_memory_clear(llama_get_memory(l->ctx), true);
+    int start = 0;
+    const int np = (int) l->prefix.size();
+    if (np > 0 && n > np && std::equal(l->prefix.begin(), l->prefix.end(), toks.begin())) {
+        if (llama_state_seq_set_data(l->ctx, l->state.data(), l->state.size(), 0) != 0) start = np;
+        else llama_memory_clear(llama_get_memory(l->ctx), true);
+    }
     std::string text;
-    llama_batch batch = llama_batch_get_one(toks.data(), n);
+    llama_batch batch = llama_batch_get_one(toks.data() + start, n - start);
     int rc = 0;
     for (int i = 0; i < max_tokens; i++) {
         if (llama_decode(l->ctx, batch) != 0) { rc = -3; break; }

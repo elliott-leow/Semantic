@@ -10,8 +10,10 @@ struct FileQuery {
     var explicit = false
     var contentOnly = false
 
-    init(_ input: String) {
-        text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    // `isCalc`: whether the input is arithmetic, when the caller already knows
+    init(_ input: String, isCalc: Bool? = nil) {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        text = trimmed
         for (prefix, folders) in [("file:", false), ("folder:", true)] where text.lowercased().hasPrefix(prefix) {
             explicit = true
             text = String(text.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
@@ -63,7 +65,8 @@ struct FileQuery {
             // Arithmetic such as 2*3 and ordinary questions keep their existing meaning.
             if explicit || text == "*" || text.contains("/") || text.contains(".") ||
                 (text.contains("*") && text.contains(where: { $0.isLetter }) && !text.contains(" ")) {
-                if explicit || Calc.answer(text) == nil {
+                // without a filter prefix the text is still the input, so the caller's answer applies
+                if explicit || !((text == trimmed ? isCalc : nil) ?? (Calc.answer(text) != nil)) {
                     explicit = true
                     matchesPath = text.contains("/")
                     let expanded = (text as NSString).expandingTildeInPath

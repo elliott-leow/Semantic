@@ -23,6 +23,12 @@ int sb_embed_audio(sb_ctx * c, const float * pcm16k, size_t n_samples, float * o
 
 // out[i] = dot(q, docs[i]) for n int8-quantised rows of SB_DIM
 void sb_scan_i8(const float * q, const int8_t * docs, size_t n, float * out);
+// the plain float loop sb_scan_i8 must agree with (kept for checks)
+void sb_scan_i8_ref(const float * q, const int8_t * docs, size_t n, float * out);
+// out[i] = |docs[i]|
+void sb_norms_i8(const int8_t * docs, size_t n, float * out);
+// performance cores (fallback 4)
+int sb_threads(void);
 
 // Small generative model, used only to turn a sentence into a flat JSON command.
 typedef struct sb_llm sb_llm;
@@ -30,6 +36,9 @@ sb_llm * sb_llm_init(const char * model_path, int n_ctx);
 void     sb_llm_free(sb_llm * l);
 // prompt is fully formatted; grammar is GBNF (root rule "root") or NULL. Returns bytes written, <0 on error.
 int sb_llm_generate(sb_llm * l, const char * prompt, const char * grammar, int max_tokens, char * out, int out_len);
+// Decodes a fixed prompt prefix once and keeps its state; later prompts that start with it only decode the rest.
+// Returns the prefix length in tokens, <0 on error.
+int sb_llm_cache_prefix(sb_llm * l, const char * prefix);
 
 #ifdef __cplusplus
 }

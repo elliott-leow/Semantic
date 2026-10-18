@@ -1,3 +1,4 @@
+import Accelerate
 import AppKit
 import Foundation
 import SQLite3
@@ -6,6 +7,10 @@ struct Entry {
     let path: String      // file path, or URL / opaque key for non-file kinds
     let name: String
     let lname: String
+    let stem: String      // lname without its extension
+    let words: [String]   // stem tokens other than stopwords
+    let stemCount: Int    // all stem tokens
+    let ascii: Bool       // lname is ASCII, so substring tests can compare bytes
     let pathTokens: [String]
     let lpath: String
     let tokens: [String]
@@ -18,17 +23,24 @@ struct Entry {
     let dupKey: String    // equal for copies of the same file
 }
 
-// Immutable snapshot of the index: entries plus one int8 matrix of vectors.
+// Snapshot of the index: entries plus one int8 matrix of vectors. Only the engine queue appends rows.
 final class Index {
     var entries: [Entry] = []
     var rowEntry: [Int32] = []
     var rowSrc: [UInt8] = []
     var rowLoc: [Float] = []
+    var rowNorm: [Float] = []
     var byPath: [String: Int] = [:]
     var folders = Set<String>()
+    var names = Set<String>()   // file names and names without extension, lowercased
+    var lpaths = Set<String>()  // lowercased file paths
+    var dirs = Set<String>()    // lowercased folder names occurring in some file's path
     var byID: [Int64: Int] = [:]
     var contentStore: Store?
     private(set) var vecs: UnsafeMutablePointer<Int8>?
+    private var capacity = 0
+    private var sortedRows = 0           // rows loaded in entry order, found by binary search
+    private var addedRows: [Int: [Int]] = [:]
     var rows: Int { rowEntry.count }
 
     deinit { vecs?.deallocate() }
@@ -40,52 +52,120 @@ final class Index {
         // A read transaction keeps metadata and vector row mappings in the same snapshot.
         store.exec("BEGIN")
         defer { store.exec("COMMIT") }
-        var ids: [Int64: Int] = [:]
-        store.run("SELECT id,path,name,kind,mtime,size,snippet FROM files ORDER BY id") { st in
+        ix.loadMetadata(store)
+        if vectors { ix.loadVectors(store) }
+        return ix
+    }
+
+    func loadMetadata(_ store: Store) {
+        var ids: [Int64: Int] = [:], parents = Set<String>()
+        store.run("SELECT id,path,name,kind,mtime,size,snippet FROM files ORDER BY id") { [self] st in
             let name = colText(st, 2), path = colText(st, 1)
             let kind = Kind(rawValue: Int(sqlite3_column_int(st, 3))) ?? .other
             let toks = nameTokens(name), size = Int(sqlite3_column_int64(st, 5))
             let ext = kind.isFile ? (name as NSString).pathExtension.lowercased() : ""
+            let lname = name.lowercased(), lpath = path.lowercased()
+            // NSString results are bridged; a native copy compares several times faster
+            var stem = (lname as NSString).deletingPathExtension
+            stem.makeContiguousUTF8()
+            let stemToks = nameTokens(stem)
             let base = (name as NSString).deletingPathExtension.lowercased()
                 .replacingOccurrences(of: "(\\s*\\(\\d+\\)|\\s+copy(\\s+\\d+)?)+$", with: "", options: .regularExpression)
             // Do not collapse numbered chapters or unrelated same-size files in other folders.
             let parent = (path as NSString).deletingLastPathComponent
             let dup = kind.isFile && kind != .folder && kind != .app && size > 0 ? "\(parent)/\(base).\(ext)#\(size)" : path
-            ids[sqlite3_column_int64(st, 0)] = ix.entries.count
-            ix.byPath[path] = ix.entries.count
-            if kind == .folder { ix.folders.insert(name.lowercased()) }
-            ix.entries.append(Entry(path: path, name: name, lname: name.lowercased(), pathTokens: nameTokens(parent), lpath: path.lowercased(), tokens: toks,
-                                    initials: String(toks.compactMap(\.first)), kind: kind,
-                                    mtime: sqlite3_column_double(st, 4), size: size, ext: ext,
-                                    snippet: kind.isFile ? "" : colText(st, 6), dupKey: dup))
+            ids[sqlite3_column_int64(st, 0)] = entries.count
+            byPath[path] = entries.count
+            if kind == .folder { folders.insert(lname) }
+            if kind.isFile {
+                names.insert(lname); names.insert(stem); lpaths.insert(lpath)
+                let lparent = (lpath as NSString).deletingLastPathComponent
+                if parents.insert(lparent).inserted {
+                    for c in lparent.split(separator: "/") { dirs.insert(String(c)) }
+                }
+            }
+            entries.append(Entry(path: path, name: name, lname: lname, stem: stem, words: stemToks.filter { !stopwords.contains($0) },
+                                 stemCount: stemToks.count, ascii: lname.utf8.allSatisfy { $0 < 0x80 }, pathTokens: nameTokens(parent), lpath: lpath, tokens: toks,
+                                 initials: String(toks.compactMap(\.first)), kind: kind,
+                                 mtime: sqlite3_column_double(st, 4), size: size, ext: ext,
+                                 snippet: kind.isFile ? "" : colText(st, 6), dupKey: dup))
         }
-        ix.byID = ids
-        guard vectors else { return ix }
+        byID = ids
+    }
+
+    func loadVectors(_ store: Store) {
         var n = 0
         store.run("SELECT count(*) FROM vecs") { n = Int(sqlite3_column_int64($0, 0)) }
-        guard n > 0 else { return ix }
+        guard n > 0 else { return }
         let buf = UnsafeMutablePointer<Int8>.allocate(capacity: n * DIM)
-        ix.vecs = buf
-        store.run("SELECT file_id,src,v,loc FROM vecs ORDER BY file_id") { st in
+        vecs?.deallocate()
+        vecs = buf
+        capacity = n
+        var sorted = true
+        store.run("SELECT file_id,src,v,loc FROM vecs ORDER BY file_id") { [self] st in
             let src = Int(sqlite3_column_int(st, 1))
-            guard let i = ids[sqlite3_column_int64(st, 0)], (0..<SRC_COUNT).contains(src),
-                  ix.rows < n, sqlite3_column_bytes(st, 2) == DIM, let blob = sqlite3_column_blob(st, 2) else { return }
-            memcpy(buf + ix.rows * DIM, blob, DIM)
-            ix.rowEntry.append(Int32(i))
-            ix.rowSrc.append(UInt8(src))
-            ix.rowLoc.append(Float(sqlite3_column_double(st, 3)))
+            guard let i = byID[sqlite3_column_int64(st, 0)], (0..<SRC_COUNT).contains(src),
+                  rows < n, sqlite3_column_bytes(st, 2) == DIM, let blob = sqlite3_column_blob(st, 2) else { return }
+            memcpy(buf + rows * DIM, blob, DIM)
+            if let last = rowEntry.last, last > Int32(i) { sorted = false }
+            rowEntry.append(Int32(i))
+            rowSrc.append(UInt8(src))
+            rowLoc.append(Float(sqlite3_column_double(st, 3)))
         }
-        return ix
+        rowNorm = [Float](repeating: 0, count: rows)
+        sb_norms_i8(buf, rows, &rowNorm)
+        if sorted { sortedRows = rows } else {
+            for r in 0..<rows { addedRows[Int(rowEntry[r]), default: []].append(r) }
+        }
     }
 
     // Value arrays are shared until mutated; never share a SQLite connection between queues.
-    func metadataSnapshot() -> Index {
+    func metadataSnapshot(store: Store? = nil) -> Index {
         let ix = Index()
         ix.entries = entries
         ix.byPath = byPath
         ix.byID = byID
         ix.folders = folders
+        ix.names = names
+        ix.lpaths = lpaths
+        ix.dirs = dirs
+        ix.contentStore = store
         return ix
+    }
+
+    // a folder of this (lowercased) name is somewhere on an indexed file's path
+    func hasFolder(_ name: String) -> Bool { folders.contains(name) || dirs.contains(name) }
+
+    func rows(of e: Int) -> [Int] {
+        var lo = 0, hi = sortedRows
+        while lo < hi { let m = (lo + hi) / 2; if rowEntry[m] < Int32(e) { lo = m + 1 } else { hi = m } }
+        var out: [Int] = []
+        while lo < sortedRows, rowEntry[lo] == Int32(e) { out.append(lo); lo += 1 }
+        return out + (addedRows[e] ?? [])
+    }
+
+    // Puts one new vector in place (replacing the entry's only row from that source). False when
+    // the snapshot cannot express the change and must be reloaded instead.
+    func append(entry e: Int, src: Int, vector v: Data) -> Bool {
+        guard v.count == DIM, e < entries.count else { return false }
+        let same = rows(of: e).filter { Int(rowSrc[$0]) == src }
+        if same.count > 1 { return false }
+        let r: Int
+        if let old = same.first { r = old; rowLoc[r] = 0 } else {
+            if rows == capacity {
+                capacity = max(64, capacity * 2)
+                let buf = UnsafeMutablePointer<Int8>.allocate(capacity: capacity * DIM)
+                if let vecs { buf.update(from: vecs, count: rows * DIM); vecs.deallocate() }
+                vecs = buf
+            }
+            r = rows
+            rowEntry.append(Int32(e)); rowSrc.append(UInt8(src)); rowLoc.append(0); rowNorm.append(0)
+            addedRows[e, default: []].append(r)
+        }
+        guard let vecs else { return false }
+        _ = v.withUnsafeBytes { memcpy(vecs + r * DIM, $0.baseAddress!, DIM) }
+        sb_norms_i8(vecs + r * DIM, 1, &rowNorm[r])
+        return true
     }
 
     func vector(row r: Int) -> [Float] {
@@ -98,6 +178,7 @@ struct SearchResult {
     static let fileLimit = 5
     var hits: [Hit]
     var note: String
+    var lookup: String?  // a plain name search that found few files: worth asking Spotlight
 
     init(hits: [Hit], note: String = "") {
         var files = 0
@@ -129,7 +210,23 @@ final class Engine {
     private var intentOf: [Int] = []
     private let lock = NSLock()
     private var generation = 0
+    private var scratch = Scratch()
+    private let spotQueue = DispatchQueue(label: "semantic.spotlight", qos: .userInitiated)
     var debug = false
+    var learning = true   // off to measure ranking on its own (`--eval`)
+    #if SEARCH_TESTS
+    var spotlight = false
+    #else
+    var spotlight = true
+    #endif
+
+    // per-query buffers, reused on the engine queue
+    private final class Scratch {
+        var raw: [Float] = []
+        var sem: [Float] = []
+        var admitted: [Bool] = []
+        var best: [Int32] = []
+    }
 
     var onChange: (() -> Void)? // model became ready or the index was reloaded
 
@@ -145,16 +242,43 @@ final class Engine {
         DispatchQueue.getSpecific(key: Self.onQueue) == true ? f() : queue.sync(execute: f)
     }
 
+    private final class Load {
+        let ready = DispatchSemaphore(value: 0)
+        var index: Index?
+        var store: Store?
+    }
+
+    // Metadata is read once, inside the transaction that then reads vectors: file search gets it as soon
+    // as it is read, even while the model queue is busy, and both queues keep their enqueue order.
     func reloadIndex() {
-        // Metadata and exact content remain available even while the model queue is busy.
+        let job = Load()
         quickQueue.async {
-            self.quickIndex = Index.load(vectors: false)
+            defer { job.ready.signal() }
+            guard let store = Store(readonly: true) else { self.quickIndex = Index(); return }
+            store.exec("BEGIN")
+            let ix = Index()
+            ix.loadMetadata(store)
+            ix.contentStore = store
+            (job.index, job.store) = (ix, store)
+            self.quickIndex = ix.metadataSnapshot(store: Store(readonly: true))
             DispatchQueue.main.async { self.onChange?() }
         }
         queue.async {
-            self.index = Index.load()
+            job.ready.wait()
+            guard let ix = job.index, let store = job.store else { self.index = Index(); return }
+            ix.loadVectors(store)
+            store.exec("COMMIT")
+            self.index = ix
             DispatchQueue.main.async { self.onChange?() }
         }
+    }
+
+    // on the engine queue: a full load now, shared with file search
+    private func loadNow() {
+        let ix = Index.load()
+        index = ix
+        let quick = ix.metadataSnapshot(store: Store(readonly: true))
+        quickQueue.async { self.quickIndex = quick }
     }
 
     func warm(wait: Bool = false) {
@@ -219,18 +343,24 @@ final class Engine {
         var todo: [(Int64, String, String)] = []
         store.run("SELECT id, name, snippet FROM files WHERE state = 2 LIMIT 5") { todo.append((sqlite3_column_int64($0, 0), colText($0, 1), colText($0, 2))) }
         guard !todo.isEmpty else { return }
+        // clips copied since the last load are not in the snapshot: load once, then add vectors in place
+        var reload = todo.contains { index.byID[$0.0] == nil }
+        if reload { loadNow() }
         var completed = 0
         for (id, name, body) in todo {
             if let v = e.document(title: name, body: String(body.prefix(900))) {
+                let q = quantize(v)
                 store.exec("BEGIN")
                 store.run("DELETE FROM vecs WHERE file_id=? AND src=?", [id, Src.text.rawValue])
-                store.run("INSERT INTO vecs(file_id,src,v) VALUES(?,?,?)", [id, Src.text.rawValue, quantize(v)])
+                store.run("INSERT INTO vecs(file_id,src,v) VALUES(?,?,?)", [id, Src.text.rawValue, q])
                 store.run("UPDATE files SET state = 1 WHERE id = ?", [id])
                 store.exec("COMMIT")
                 completed += 1
+                if let i = index.byID[id], index.append(entry: i, src: Src.text.rawValue, vector: q) { continue }
+                reload = true
             }
         }
-        index = Index.load()
+        if reload { loadNow() }
         DispatchQueue.main.async { self.onChange?() }
         if todo.count == 5 && completed > 0 { queue.async { self.embedPending() } }
     }
@@ -246,7 +376,9 @@ final class Engine {
         Habits.shared.recordPick(Self.norm(query), key)
     }
 
-    private func boosts(_ q: String) -> [String: Float] { Habits.shared.boosts(q) }
+    private func boosts(_ q: String) -> [String: Float] { learning ? Habits.shared.boosts(q) : [:] }
+
+    func indexed(_ key: String) -> Bool { locked { index.byPath[key] != nil } }
 
     // Before anything is typed: what habit says is wanted now (time of day, the app in front, recency).
     // Only things still present in the index are offered, so a deleted file or app quietly drops out.
@@ -256,7 +388,9 @@ final class Engine {
             guard let i = ix.byPath[key] else { continue }
             let e = ix.entries[i]
             if e.kind.isFile, !FileManager.default.fileExists(atPath: e.path) { continue }
-            hits.append(hit(Ranked(i: i, score: score, lex: 0, loc: 0, src: 0), copies: 0, snapshot: ix))
+            var r = Ranked(i: i, score: score, lex: 0, loc: 0, src: 0)
+            r.why.learned = score
+            hits.append(hit(r, copies: 0, snapshot: ix))
         }
         return SearchResult(hits: hits, note: hits.isEmpty ? "" : "Suggested")
     }
@@ -274,8 +408,8 @@ final class Engine {
     func findApp(_ name: String) -> String? {
         locked {
             let q = name.lowercased().trimmingCharacters(in: .whitespaces)
-            let qt = nameTokens(q)
-            return index.entries.filter { $0.kind == .app }.map { ($0, lex(q, qt, $0)) }.filter { $0.1 >= 0.6 }.max { $0.1 < $1.1 }?.0.path
+            let lq = LexQuery(q, nameTokens(q))
+            return index.entries.filter { $0.kind == .app }.map { ($0, Self.lex(lq, $0)) }.filter { $0.1 >= 0.6 }.max { $0.1 < $1.1 }?.0.path
         }
     }
 
@@ -285,7 +419,7 @@ final class Engine {
         locked {
             let q = phrase.lowercased().replacingOccurrences(of: "^(the|my|a|an|this|that) ", with: "", options: .regularExpression)
             let ok: Set<Kind> = [.doc, .image, .audio, .video, .other]
-            var r = rank(rest: q, full: q, filters: Filters(), gate: 3.4, boosts: [:]).filter { ok.contains(index.entries[$0.i].kind) }.prefix(25).map { x -> Ranked in
+            var r = rank(rest: q, filters: Filters(), gate: 3.4, boosts: [:]).filter { ok.contains(index.entries[$0.i].kind) }.prefix(25).map { x -> Ranked in
                 var x = x
                 let k = index.entries[x.i].kind
                 x.score += k == .doc ? 0.8 : (k == .other ? -0.6 : 0)
@@ -325,15 +459,47 @@ final class Engine {
                 self.deliver(self.suggestions(self.quickIndex), generation: gen, done: done)
                 return
             }
-            if chips.isEmpty, let quick = self.quickFiles(text) {
+            // both passes share one reading of the text as arithmetic
+            let calc = chips.isEmpty ? Calc.answer(text) : nil
+            let stale = { !self.isCurrent(gen) }
+            if chips.isEmpty, let quick = self.quickFiles(text, calc: calc, stale: stale) {
                 self.deliver(quick, generation: gen, done: done)
             }
             // Queue refinement after quick delivery was enqueued: it can never be followed
             // by an older preliminary result for the same generation.
             self.queue.async {
                 guard self.isCurrent(gen) else { return }
-                let r = self.build(text, chips: chips)
+                let r = self.build(text, chips: chips, calc: .some(calc), stale: stale)
+                guard self.isCurrent(gen) else { return }
                 self.deliver(r, generation: gen, done: done)
+                if self.spotlight, let lookup = r.lookup { self.addSpotlight(lookup, to: r, generation: gen, done: done) }
+            }
+        }
+    }
+
+    private static let roots = Indexer.roots().map { $0 + "/" }
+
+    // Files outside the indexed folders, by name, delivered as a follow-up when the index found few.
+    private func addSpotlight(_ text: String, to r: SearchResult, generation gen: Int, done: @escaping (SearchResult) -> Void) {
+        let ix = index, have = Set(r.hits.compactMap(\.path))
+        let room = SearchResult.fileLimit - have.count
+        guard room > 0 else { return }
+        spotQueue.async {
+            guard self.isCurrent(gen) else { return }
+            let paths = Spotlight.names(text, limit: room) { p in
+                have.contains(p) || ix.byPath[p] != nil || Self.roots.contains { p.hasPrefix($0) }
+            }
+            guard !paths.isEmpty else { return }
+            self.queue.async {
+                guard self.isCurrent(gen) else { return }
+                var hits = r.hits
+                let at = (hits.lastIndex { $0.path != nil }).map { $0 + 1 } ?? 0
+                hits.insert(contentsOf: paths.map { p -> Hit in
+                    var h = self.pathHit(p)
+                    h.why = "Spotlight name match"
+                    return h
+                }, at: at)
+                self.deliver(SearchResult(hits: hits, note: r.note), generation: gen, done: done)
             }
         }
     }
@@ -353,28 +519,23 @@ final class Engine {
     // Preliminary results are file lookups only. Resolver and local-action interpretation
     // stay on the model queue, so an uncertain command is never provisionally executable.
     private static func hasLiteralName(_ text: String, in index: Index) -> Bool {
-        let q = text.lowercased(), expanded = (text as NSString).expandingTildeInPath.lowercased()
-        return index.entries.contains { e in
-            e.kind.isFile && (e.lname == q || (e.lname as NSString).deletingPathExtension == q || e.lpath == expanded)
-        }
+        index.names.contains(text.lowercased()) || index.lpaths.contains((text as NSString).expandingTildeInPath.lowercased())
     }
 
-    private func quickFiles(_ text: String) -> SearchResult? {
+    private func quickFiles(_ text: String, calc: CalcResult?, stale: (() -> Bool)? = nil) -> SearchResult? {
         guard !text.isEmpty else { return SearchResult(hits: []) }
-        let ix = quickIndex, query = FileQuery(text)
+        let ix = quickIndex, query = FileQuery(text, isCalc: calc != nil)
         if let error = query.error { return SearchResult(hits: [], note: error) }
         let literalName = Self.hasLiteralName(text, in: ix)
         if !query.explicit, !literalName {
-            guard Calc.answer(text) == nil, !Assistant.looksLikeQuestion(text),
+            guard calc == nil, !Assistant.looksLikeQuestion(text),
                   Calc.rx(text.lowercased(), "^(?:please )?(?:convert|turn|change|export|save|make|rename|move|copy|zip|compress|resize|rotate|trash|delete|print|email|send|mail|remind|set|create|run|quit|close)\\b.*") == nil else { return nil }
         }
         let filters: Filters, rest: String
         if query.explicit { (filters, rest) = (query.filters, query.text.lowercased()) }
         else if literalName { (filters, rest) = (Filters(), text.lowercased()) }
         else {
-            (filters, rest) = Filters.parse(text, folderExists: { name in
-                ix.folders.contains(name) || ix.entries.contains { $0.kind.isFile && $0.path.range(of: "/\(name)/", options: .caseInsensitive) != nil }
-            })
+            (filters, rest) = Filters.parse(text, folderExists: ix.hasFolder)
         }
         let ranked: [Ranked]
         if query.pattern != nil {
@@ -383,9 +544,10 @@ final class Engine {
                 return $0.element.path < $1.element.path
             }.map { Ranked(i: $0.offset, score: 1, lex: 1, loc: 0, src: 0) }
         } else {
-            ranked = rank(rest: rest, full: text.lowercased(), filters: filters, gate: 3.4, boosts: boosts(Self.norm(query.explicit ? query.text : text)),
-                          contentOnly: query.contentOnly, snapshot: ix, semantic: false)
+            ranked = rank(rest: rest, filters: filters, gate: 3.4, boosts: boosts(Self.norm(query.explicit ? query.text : text)),
+                          contentOnly: query.contentOnly, snapshot: ix, semantic: false, stale: stale)
         }
+        if stale?() == true { return nil }
         var seen = Set<String>()
         let top = ranked.filter { r in
             let e = ix.entries[r.i]
@@ -405,51 +567,123 @@ final class Engine {
         !text.contains(" ") && hits.first(where: { $0.path != nil })?.tag == Kind.app.label
     }
 
-    private func lex(_ q: String, _ qt: [String], _ e: Entry) -> Float {
-        if q.isEmpty { return 0 }
-        let stem = (e.lname as NSString).deletingPathExtension
-        if e.lname == q || stem == q { return 1 }
-        if !qt.isEmpty, !q.contains("/") {
-            let words = nameTokens(stem).filter { !stopwords.contains($0) }
-            if words == qt { return 1 }
-            if words.starts(with: qt) { return 0.9 }
+    // What lex needs from a query, worked out once rather than for every entry.
+    struct LexQuery: Equatable {
+        let q: String, qt: [String], qtLong: [Bool], expanded: String, suffix: String
+        let slash: Bool, len: Int, ascii: Bool
+
+        init(_ q: String, _ qt: [String]) {
+            self.q = q
+            self.qt = qt
+            qtLong = qt.map { $0.count >= 4 }
+            expanded = (q as NSString).expandingTildeInPath.lowercased()
+            suffix = "/" + q
+            slash = q.contains("/")
+            len = q.count
+            ascii = q.utf8.allSatisfy { $0 < 0x80 }
         }
-        let expanded = (q as NSString).expandingTildeInPath.lowercased()
-        if e.lpath == expanded || (q.contains("/") && e.lpath.hasSuffix("/" + q)) { return 1 }
+
+        // rank's reading: stopwords are dropped unless nothing else is left
+        static func ranking(_ q: String) -> LexQuery {
+            let all = nameTokens(q), qt = all.filter { !stopwords.contains($0) }
+            return LexQuery(q, qt.isEmpty ? all : qt)
+        }
+    }
+
+    static func lex(_ x: LexQuery, _ e: Entry) -> Float {
+        let q = x.q, qt = x.qt
+        if x.len == 0 { return 0 }
+        if e.lname == q || e.stem == q { return 1 }
+        if !qt.isEmpty, !x.slash {
+            if e.words == qt { return 1 }
+            if e.words.starts(with: qt) { return 0.9 }
+        }
+        if e.lpath == x.expanded || (x.slash && e.lpath.hasSuffix(x.suffix)) { return 1 }
         // "chrome" names Google Chrome as surely as a file named chrome.tsx
         if e.kind == .app, !qt.isEmpty, qt.allSatisfy({ e.tokens.contains($0) }) { return 0.95 }
         if e.lname.hasPrefix(q) { return 0.9 }
         var best: Float = 0
         if !qt.isEmpty {
-            let names = qt.filter { t in e.tokens.contains { $0.hasPrefix(t) } }.count
-            let paths = qt.filter { t in e.tokens.contains { $0.hasPrefix(t) } || e.pathTokens.contains { $0.hasPrefix(t) } }.count
+            var names = 0, paths = 0
+            for t in qt {
+                if e.tokens.contains(where: { $0.hasPrefix(t) }) { names += 1; paths += 1 }
+                else if e.pathTokens.contains(where: { $0.hasPrefix(t) }) { paths += 1 }
+            }
             if names == qt.count { best = 0.8 }
             else if paths == qt.count { best = 0.7 }
             else { best = 0.25 * Float(names) / Float(qt.count) }
         }
-        if q.count >= 3, e.lname.contains(q) { best = max(best, 0.65) }
-        if q.contains("/"), e.lpath.contains(expanded) { best = max(best, 0.7) }
-        if e.kind == .app, q.count >= 2, e.initials.hasPrefix(q) { best = max(best, 0.7) }
-        if best < 0.5, !qt.isEmpty, qt.count <= 4,
-           qt.allSatisfy({ term in e.tokens.contains { token in
-               token.hasPrefix(term) || (term.count >= 4 && Self.oneEdit(term, token))
-           } }) { best = (qt.count == e.tokens.count || qt.count == nameTokens(stem).count) ? 0.62 : 0.56 }
+        if x.len >= 3, x.ascii && e.ascii ? Self.bytesContain(e.lname, q) : e.lname.contains(q) { best = max(best, 0.65) }
+        if x.slash, e.lpath.contains(x.expanded) { best = max(best, 0.7) }
+        if e.kind == .app, x.len >= 2, e.initials.hasPrefix(q) { best = max(best, 0.7) }
+        if best < 0.5, !qt.isEmpty, qt.count <= 4 {
+            var all = true
+            for (n, term) in qt.enumerated() where !e.tokens.contains(where: { token in
+                token.hasPrefix(term) || (x.qtLong[n] && Self.oneEdit(term, token))
+            }) { all = false; break }
+            if all { best = (qt.count == e.tokens.count || qt.count == e.stemCount) ? 0.62 : 0.56 }
+        }
         return best
     }
 
+    private static func bytesContain(_ s: String, _ t: String) -> Bool {
+        var s = s, t = t
+        return s.withUTF8 { a in t.withUTF8 { b in
+            b.isEmpty || (a.count >= b.count && memmem(a.baseAddress!, a.count, b.baseAddress!, b.count) != nil)
+        } }
+    }
+
+    #if SEARCH_TESTS
+    static func lexForChecks(_ q: String, _ qt: [String], _ e: Entry) -> Float { lex(LexQuery(q, qt), e) }
+    #endif
+
     // One insertion, deletion, substitution or adjacent transposition; short words stay exact.
     static func oneEdit(_ a: String, _ b: String) -> Bool {
-        guard abs(a.utf8.count - b.utf8.count) <= 4 else { return false }
+        let na = a.utf8.count, nb = b.utf8.count
+        guard abs(na - nb) <= 4 else { return false }
+        // ASCII (nearly every name) compares bytes in place; anything else compares characters
+        if a.utf8.allSatisfy({ $0 < 0x80 }), b.utf8.allSatisfy({ $0 < 0x80 }) {
+            guard abs(na - nb) <= 1 else { return false }
+            var a = a, b = b
+            return a.withUTF8 { x in b.withUTF8 { y in oneEdit(x, y) } }
+        }
         let x = Array(a), y = Array(b)
         guard abs(x.count - y.count) <= 1 else { return false }
+        return oneEdit(x, y)
+    }
+
+    private static func oneEdit<C: RandomAccessCollection>(_ x: C, _ y: C) -> Bool where C.Element: Equatable, C.Index == Int {
+        let nx = x.count, ny = y.count, n = min(nx, ny)
         var i = 0
-        while i < min(x.count, y.count), x[i] == y[i] { i += 1 }
-        if i == min(x.count, y.count) { return true }
-        if x.count == y.count {
-            if x.dropFirst(i + 1).elementsEqual(y.dropFirst(i + 1)) { return true }
-            return i + 1 < x.count && x[i] == y[i + 1] && x[i + 1] == y[i] && x.dropFirst(i + 2).elementsEqual(y.dropFirst(i + 2))
+        while i < n, x[x.startIndex + i] == y[y.startIndex + i] { i += 1 }
+        if i == n { return true }
+        func same(_ a: Int, _ b: Int) -> Bool {
+            // x[a...] == y[b...]
+            guard nx - a == ny - b else { return false }
+            var a = a, b = b
+            while a < nx { if x[x.startIndex + a] != y[y.startIndex + b] { return false }; a += 1; b += 1 }
+            return true
         }
-        return x.count > y.count ? x.dropFirst(i + 1).elementsEqual(y.dropFirst(i)) : x.dropFirst(i).elementsEqual(y.dropFirst(i + 1))
+        if nx == ny {
+            if same(i + 1, i + 1) { return true }
+            return i + 1 < nx && x[x.startIndex + i] == y[y.startIndex + i + 1] && x[x.startIndex + i + 1] == y[y.startIndex + i] && same(i + 2, i + 2)
+        }
+        return nx > ny ? same(i + 1, i) : same(i, i + 1)
+    }
+
+    // how a score was made up, for the ⌥ breakdown
+    struct Why {
+        var name: Float = 0, meaning: Float = 0, words: Float = 0, app: Float = 0, kind: Float = 0
+        var learned: Float = 0, recent: Float = 0, similarity: Float = 0
+        var newest = false
+
+        var text: String {
+            if newest { return "newest first" }
+            func f(_ v: Float) -> String { v == v.rounded() ? String(Int(v)) : String(format: "%.1f", v) }
+            return [("name", name), ("meaning", meaning), ("words", words), ("app", app), ("type", kind),
+                    ("learned", learned), ("recent", recent)].filter { abs($0.1) >= 0.05 }.map { "\($0.0) \(f($0.1))" }
+                .joined(separator: " · ") + (similarity > 0 ? String(format: "similarity %.2f", similarity) : "")
+        }
     }
 
     struct Ranked {
@@ -460,11 +694,46 @@ final class Engine {
         let src: Int
         var excerpt = ""
         var learned: Float = 0  // part of the score that came from picks and habit rather than the query
+        var match: Store.ContentMatch?  // its excerpt is read only if the row is shown
+        var why = Why()
     }
 
     struct SemanticSignal {
         let score: Float
         let admitted: Bool
+    }
+
+    private struct SourceStats {
+        var mean = [Float](repeating: 0, count: SRC_COUNT), sd = [Float](repeating: 1, count: SRC_COUNT)
+        var cnt = [Float](repeating: 0, count: SRC_COUNT)
+    }
+
+    private static func stats(_ raw: UnsafeBufferPointer<Float>, _ sources: [UInt8]) -> SourceStats {
+        var sum = [Float](repeating: 0, count: SRC_COUNT), sq = sum, st = SourceStats()
+        sources.withUnsafeBufferPointer { src in
+            for r in 0..<raw.count {
+                let s = Int(src[r]), v = raw[r]
+                sum[s] += v; sq[s] += v * v; st.cnt[s] += 1
+            }
+        }
+        for s in 0..<SRC_COUNT where st.cnt[s] > 1 {
+            st.mean[s] = sum[s] / st.cnt[s]
+            st.sd[s] = max(1e-3, (sq[s] / st.cnt[s] - st.mean[s] * st.mean[s]).squareRoot())
+        }
+        return st
+    }
+
+    @inline(__always)
+    private static func signal(_ raw: Float, _ s: Int, _ st: SourceStats, gate: Float) -> SemanticSignal {
+        if st.cnt[s] - 1 < gate * gate {
+            // sb_scan_i8 returns the dot product against QSCALE-quantized
+            // unit vectors, so division recovers approximate cosine.
+            let cosine = raw / QSCALE
+            let floor: Float = gate > 3.4 ? 0.78 : 0.70
+            return SemanticSignal(score: 6 * max(0, min(1, cosine)), admitted: cosine >= floor)
+        }
+        let z = (raw - st.mean[s]) / st.sd[s]
+        return SemanticSignal(score: z, admitted: z >= gate)
     }
 
     // A population z-score cannot exceed sqrt(n - 1). When that makes the
@@ -473,43 +742,33 @@ final class Engine {
     // fixtures with the shipped model; they are not a universal accuracy claim.
     static func semanticSignals(raw: [Float], sources: [UInt8], gate: Float) -> [SemanticSignal] {
         precondition(raw.count == sources.count)
-        var sum = [Float](repeating: 0, count: SRC_COUNT), sq = sum, cnt = sum
-        for r in raw.indices {
-            let s = Int(sources[r])
-            sum[s] += raw[r]; sq[s] += raw[r] * raw[r]; cnt[s] += 1
-        }
-        var mean = [Float](repeating: 0, count: SRC_COUNT), sd = [Float](repeating: 1, count: SRC_COUNT)
-        for s in 0..<SRC_COUNT where cnt[s] > 1 {
-            mean[s] = sum[s] / cnt[s]
-            sd[s] = max(1e-3, (sq[s] / cnt[s] - mean[s] * mean[s]).squareRoot())
-        }
-        return raw.indices.map { r in
-            let s = Int(sources[r])
-            if cnt[s] - 1 < gate * gate {
-                // sb_scan_i8 returns the dot product against QSCALE-quantized
-                // unit vectors, so division recovers approximate cosine.
-                let cosine = raw[r] / QSCALE
-                let floor: Float = gate > 3.4 ? 0.78 : 0.70
-                return SemanticSignal(score: 6 * max(0, min(1, cosine)), admitted: cosine >= floor)
-            }
-            let z = (raw[r] - mean[s]) / sd[s]
-            return SemanticSignal(score: z, admitted: z >= gate)
-        }
+        let st = raw.withUnsafeBufferPointer { stats($0, sources) }
+        return raw.indices.map { signal(raw[$0], Int(sources[$0]), st, gate: gate) }
     }
 
     #if SEARCH_TESTS
     // Exercise the production admission, filename ordering and passage selection
     // without loading a model or relying on its floating-point output.
     func semanticRanksForChecks(_ query: String, vector: [Float], gate: Float = 3.4) -> [Ranked] {
-        rank(rest: query, full: query, filters: Filters(), gate: gate, boosts: [:], queryVector: vector)
+        rank(rest: query, filters: Filters(), gate: gate, boosts: [:], queryVector: vector)
+    }
+
+    func rankForChecks(_ query: String, stale: (() -> Bool)? = nil) -> [Ranked] {
+        rank(rest: query, filters: Filters(), gate: 3.4, boosts: [:], habits: [:], stale: stale)
     }
     #endif
 
-    // every entry worth showing for a query, best first
-    private func rank(rest: String, full: String, filters: Filters, gate: Float, boosts: [String: Float], nameOnly: Bool = false, contentOnly: Bool = false,
-                      snapshot: Index? = nil, semantic: Bool = true, habits: [String: Float]? = nil, queryVector: [Float]? = nil) -> [Ranked] {
+    // every entry's name match for a query, in entry order
+    private static func lexes(_ x: LexQuery, _ ix: Index) -> [Float] {
+        ix.entries.withUnsafeBufferPointer { es in es.map { lex(x, $0) } }
+    }
+
+    // every entry worth showing for a query, best first; empty once `stale` says nobody is waiting for it
+    private func rank(rest: String, filters: Filters, gate: Float, boosts: [String: Float], nameOnly: Bool = false, contentOnly: Bool = false,
+                      snapshot: Index? = nil, semantic: Bool = true, habits: [String: Float]? = nil, queryVector: [Float]? = nil,
+                      lexes: [Float]? = nil, stale: (() -> Bool)? = nil) -> [Ranked] {
         let ix = snapshot ?? index
-        let habit = habits ?? Habits.shared.prior()
+        let habit = habits ?? (learning ? Habits.shared.prior() : [:])
         // a file that was learned and then moved or renamed keeps what was learned under its name
         func moved(_ learned: [String: Float]) -> [String: Float] {
             var out: [String: Float] = [:]
@@ -518,83 +777,109 @@ final class Engine {
             }
             return out
         }
-        let movedBoosts = moved(boosts), movedHabit = moved(habit)
+        // learned keys are few; look them up by entry instead of hashing every entry's path
+        func byEntry(_ learned: [String: Float]) -> [Int: Float] {
+            var out: [Int: Float] = [:]
+            for (key, v) in learned { if let i = ix.byPath[key] { out[i] = v } }
+            return out
+        }
+        let movedBoosts = moved(boosts), movedHabit = moved(habit), boostAt = byEntry(boosts), habitAt = byEntry(habit)
         let q = rest, listing = rest.isEmpty && !filters.isEmpty
-        var qt = nameTokens(q).filter { !stopwords.contains($0) }
-        if qt.isEmpty { qt = nameTokens(q) }
-        let fullTokens = nameTokens(full)
-        let identifier = qt.contains { $0.contains(where: { $0.isNumber }) }
+        let lq = LexQuery.ranking(q)
+        let identifier = lq.qt.contains { $0.contains(where: { $0.isNumber }) }
         var content: [Int: Store.ContentMatch] = [:]
         // a letter or two typed is the start of a name, not a word to look for inside files
-        if !nameOnly, contentOnly || q.count >= 3 {
+        if !nameOnly, contentOnly || lq.len >= 3 {
             for match in ix.contentStore?.contentMatches(q, literal: contentOnly) ?? [] {
                 if let i = ix.byID[match.id], match.path == ix.entries[i].path, content[i] == nil { content[i] = match }
             }
+            if stale?() == true { return [] }
         }
 
         // One embedding, one scan; source-normalized scores (or bounded absolute
         // scores for small populations) keep text, media and passages comparable.
-        let qv = semantic && !nameOnly && !contentOnly && ix.rows > 0 && q.count >= 3 ? (queryVector ?? embedder?.query(q)) : nil
-        var sem = [Float](repeating: 0, count: ix.entries.count)
-        var semanticAdmission = [Bool](repeating: false, count: ix.entries.count)
-        var bestRow = [Int32](repeating: -1, count: ix.entries.count)
+        let qv = semantic && !nameOnly && !contentOnly && ix.rows > 0 && lq.len >= 3 ? (queryVector ?? embedder?.query(q)) : nil
+        let n = ix.entries.count
+        // buffers move out of the scratch and back, so reuse never copies them
+        let reuse = DispatchQueue.getSpecific(key: Self.onQueue) == true
+        var sem: [Float] = [], admitted: [Bool] = [], bestRow: [Int32] = []
+        defer { if reuse && !sem.isEmpty { swap(&sem, &scratch.sem); swap(&admitted, &scratch.admitted); swap(&bestRow, &scratch.best) } }
         if let qv, let vecs = ix.vecs, ix.rows > 0 {
-            var raw = [Float](repeating: 0, count: ix.rows)
-            sb_scan_i8(qv, vecs, ix.rows, &raw)
-            let signals = Self.semanticSignals(raw: raw, sources: ix.rowSrc, gate: gate)
-            for r in 0..<ix.rows {
-                let e = Int(ix.rowEntry[r]), signal = signals[r]
-                // An admitted passage must remain the destination even if a
-                // different source has a higher score below its own gate.
-                if (signal.admitted && !semanticAdmission[e]) ||
-                    (signal.admitted == semanticAdmission[e] && signal.score > sem[e]) {
-                    sem[e] = signal.score; bestRow[e] = Int32(r)
-                }
-                if signal.admitted { semanticAdmission[e] = true }
+            if stale?() == true { return [] }
+            var raw: [Float] = []
+            if reuse { swap(&raw, &scratch.raw); swap(&sem, &scratch.sem); swap(&admitted, &scratch.admitted); swap(&bestRow, &scratch.best) }
+            func reset<T>(_ a: inout [T], _ count: Int, _ v: T) {
+                if a.count == count { for k in a.indices { a[k] = v } } else { a = [T](repeating: v, count: count) }
             }
+            if raw.count != ix.rows { raw = [Float](repeating: 0, count: ix.rows) }
+            reset(&sem, n, 0); reset(&admitted, n, false); reset(&bestRow, n, -1)
+            raw.withUnsafeMutableBufferPointer { sb_scan_i8(qv, vecs, ix.rows, $0.baseAddress!) }
+            raw.withUnsafeBufferPointer { raw in
+                let st = Self.stats(raw, ix.rowSrc)
+                for r in 0..<ix.rows {
+                    let e = Int(ix.rowEntry[r]), signal = Self.signal(raw[r], Int(ix.rowSrc[r]), st, gate: gate)
+                    // An admitted passage must remain the destination even if a
+                    // different source has a higher score below its own gate.
+                    if (signal.admitted && !admitted[e]) ||
+                        (signal.admitted == admitted[e] && signal.score > sem[e]) {
+                        sem[e] = signal.score; bestRow[e] = Int32(r)
+                    }
+                    if signal.admitted { admitted[e] = true }
+                }
+            }
+            if reuse { swap(&raw, &scratch.raw) }
+            if stale?() == true { return [] }
         }
+        let scanned = !sem.isEmpty
 
         // a few typed letters say little semantically, so lean on the name match until the query grows
-        let semWeight = min(1, Float(max(0, q.count - 2)) / 4)
+        let semWeight = min(1, Float(max(0, lq.len - 2)) / 4)
         let now = Date().timeIntervalSince1970
         var out: [Ranked] = []
-        for (i, e) in ix.entries.enumerated() {
-            let l = lex(q, qt, e)
-            let boost = boosts[e.path] ?? (movedBoosts.isEmpty ? 0 : movedBoosts[e.lname] ?? 0)
-            let words = content[i]
-            if contentOnly && words == nil { continue }
-            if !filters.isEmpty {
-                guard filters.matches(e) else { continue }
-            }
-            var s: Float, learned: Float = 0
-            if listing {
-                // newest first; for events, the ones closest to now
-                s = e.kind == .event ? -Float(abs(e.mtime - now) / 86400) : Float((e.mtime - 1.6e9) / 86400)
-            } else {
-                // Learned choices refine relevance; only a choice repeated for this exact query admits a result on its own.
-                guard l >= 0.5 || words != nil || (!nameOnly && !identifier && semanticAdmission[i]) || boost >= 7 else { continue }
-                if nameOnly, l < 0.9 { continue }
-                // Exact names have a protected lead over merely inferred semantic matches.
-                let nameScore: Float = l == 1 ? 16 : (l >= 0.9 ? 10 : 6 * l + (l >= 0.5 && l < 0.65 ? 3 : 0))
-                let meaning = (identifier ? 0.35 : semWeight) * min(6, sem[i])
-                s = nameScore + meaning + (words == nil ? 0 : (identifier ? 10 : 5)) + min(9, boost)
-                // launching apps is what the bar is used for most: a named app outranks a file with a similar name,
-                // and a letter or two is almost always the start of an app's name
-                if e.kind == .app { s += (l >= 0.95 ? 7 : (l >= 0.7 ? 5 : (l > 0 ? 1 : 0))) + (l >= 0.7 && q.count <= 2 ? 2 : 0) }
-                if e.kind == .other { s -= 0.4 }
-                if e.kind == .web { s -= 1 } // history is plentiful; let files win ties
-                if filters.softKinds.contains(e.kind) { s += 1.2 }
-                learned = min(9, boost)
-                if let h = habit[e.path] ?? (movedHabit.isEmpty ? nil : movedHabit[e.lname]) { s += min(4, h); learned += min(4, h) }
-                if e.mtime > 0, e.kind.isFile {
-                    let age = now - e.mtime
-                    s += age < 7 * 86400 ? 0.3 : (age < 30 * 86400 ? 0.15 : 0)
+        ix.entries.withUnsafeBufferPointer { es in
+            for i in 0..<n {
+                let e = es[i]
+                let words = content[i]
+                if contentOnly && words == nil { continue }
+                if !filters.isEmpty {
+                    guard filters.matches(e) else { continue }
                 }
+                let l = lexes?[i] ?? Self.lex(lq, e)
+                let boost = boostAt[i] ?? (movedBoosts.isEmpty ? 0 : movedBoosts[e.lname] ?? 0)
+                var s: Float, learned: Float = 0, why = Why()
+                if listing {
+                    // newest first; for events, the ones closest to now
+                    s = e.kind == .event ? -Float(abs(e.mtime - now) / 86400) : Float((e.mtime - 1.6e9) / 86400)
+                    why.newest = true
+                } else {
+                    // Learned choices refine relevance; only a choice repeated for this exact query admits a result on its own.
+                    guard l >= 0.5 || words != nil || (!nameOnly && !identifier && scanned && admitted[i]) || boost >= 7 else { continue }
+                    if nameOnly, l < 0.9 { continue }
+                    // Exact names have a protected lead over merely inferred semantic matches.
+                    why.name = l == 1 ? 16 : (l >= 0.9 ? 10 : 6 * l + (l >= 0.5 && l < 0.65 ? 3 : 0))
+                    why.meaning = scanned ? (identifier ? 0.35 : semWeight) * min(6, sem[i]) : 0
+                    why.words = words == nil ? 0 : (identifier ? 10 : 5)
+                    s = why.name + why.meaning + why.words + min(9, boost)
+                    // launching apps is what the bar is used for most: a named app outranks a file with a similar name,
+                    // and a letter or two is almost always the start of an app's name
+                    if e.kind == .app { why.app = (l >= 0.95 ? 7 : (l >= 0.7 ? 5 : (l > 0 ? 1 : 0))) + (l >= 0.7 && lq.len <= 2 ? 2 : 0); s += why.app }
+                    if e.kind == .other { s -= 0.4; why.kind -= 0.4 }
+                    if e.kind == .web { s -= 1; why.kind -= 1 } // history is plentiful; let files win ties
+                    if filters.softKinds.contains(e.kind) { s += 1.2; why.kind += 1.2 }
+                    learned = min(9, boost)
+                    if let h = habitAt[i] ?? (movedHabit.isEmpty ? nil : movedHabit[e.lname]) { s += min(4, h); learned += min(4, h) }
+                    why.learned = learned
+                    if e.mtime > 0, e.kind.isFile {
+                        let age = now - e.mtime
+                        why.recent = age < 7 * 86400 ? 0.3 : (age < 30 * 86400 ? 0.15 : 0)
+                        s += why.recent
+                    }
+                }
+                let r = scanned ? Int(bestRow[i]) : -1
+                // An exact passage is the most useful destination when exact words matched.
+                out.append(Ranked(i: i, score: s, lex: l, loc: words?.loc ?? (r >= 0 ? ix.rowLoc[r] : 0),
+                                  src: words?.src ?? (r >= 0 ? Int(ix.rowSrc[r]) : 0), learned: learned, match: words, why: why))
             }
-            let r = Int(bestRow[i])
-            // An exact passage is the most useful destination when exact words matched.
-            out.append(Ranked(i: i, score: s, lex: l, loc: words?.loc ?? (r >= 0 ? ix.rowLoc[r] : 0),
-                              src: words?.src ?? (r >= 0 ? Int(ix.rowSrc[r]) : 0), excerpt: words?.excerpt ?? "", learned: learned))
         }
         out.sort {
             if $0.score != $1.score { return $0.score > $1.score }
@@ -628,6 +913,16 @@ final class Engine {
     static func clock(_ t: Float) -> String { String(format: "%d:%02d", Int(t) / 60, Int(t) % 60) }
 
     private func hit(_ r: Ranked, copies: Int, snapshot: Index? = nil) -> Hit {
+        var h = makeHit(r, copies: copies, snapshot: snapshot)
+        h.why = r.why.text
+        let e = (snapshot ?? index).entries[r.i]
+        if (e.kind.isFile && e.kind != .app || e.kind == .event) && e.mtime != 0 { h.date = e.mtime }
+        return h
+    }
+
+    private func makeHit(_ r: Ranked, copies: Int, snapshot: Index?) -> Hit {
+        var r = r
+        if r.excerpt.isEmpty, let m = r.match { r.excerpt = (snapshot ?? index).contentStore?.excerpt(m) ?? "" }
         let e = (snapshot ?? index).entries[r.i]
         let path = e.path
         switch e.kind {
@@ -710,6 +1005,7 @@ final class Engine {
         if Calc.rx(text, "^(email|mail|send)\\b.*") != nil, Calc.rx(text.lowercased(), "^send (it |this )?to (my |the )?(desktop|documents|downloads)\\b.*") == nil {
             var h = Commands.email(text, nil, attached: files)
             if LLM.available {
+                LLM.shared.preload()
                 h.refine = { done in
                     LLM.shared.command(text, file: files.first) { j in
                         done((j?["action"] as? String) == "email" ? self.locked { Commands.email(text, j, attached: files) } : nil)
@@ -724,6 +1020,7 @@ final class Engine {
         let asks = Assistant.rows(question ?? text, files: files)
         let ask = asks[0]
         guard !Assistant.looksLikeQuestion(question ?? text), text.count >= 4, LLM.available else { return SearchResult(hits: asks) }
+        LLM.shared.preload()
         var h = Hit(title: "Working out “\(text)”…", subtitle: (files[0] as NSString).lastPathComponent, icon: .symbol("sparkles"), tag: "Action", isPending: true, stay: true) { _ in }
         h.refine = { done in
             LLM.shared.command(text, file: files.first) { j in
@@ -767,7 +1064,7 @@ final class Engine {
         return SearchResult(hits: hits, note: ref.label)
     }
 
-    private func explicitFiles(_ query: FileQuery) -> SearchResult {
+    private func explicitFiles(_ query: FileQuery, stale: (() -> Bool)?) -> SearchResult {
         if let error = query.error { return SearchResult(hits: [], note: error) }
         let ranked: [Ranked]
         if query.pattern != nil {
@@ -776,8 +1073,8 @@ final class Engine {
                 return $0.element.path < $1.element.path
             }.map { Ranked(i: $0.offset, score: 1, lex: 1, loc: 0, src: 0) }
         } else {
-            ranked = rank(rest: query.text.lowercased(), full: query.text.lowercased(), filters: query.filters,
-                          gate: 3.4, boosts: boosts(Self.norm(query.text)), contentOnly: query.contentOnly).filter { query.matches(index.entries[$0.i]) }
+            ranked = rank(rest: query.text.lowercased(), filters: query.filters, gate: 3.4, boosts: boosts(Self.norm(query.text)),
+                          contentOnly: query.contentOnly, stale: stale).filter { query.matches(index.entries[$0.i]) }
         }
         var seen = Set<String>()
         let top = ranked.filter { seen.insert(index.entries[$0.i].dupKey).inserted }.prefix(SearchResult.fileLimit)
@@ -787,16 +1084,17 @@ final class Engine {
         return SearchResult(hits: hits, note: query.filters.notes.joined(separator: " · "))
     }
 
-    func build(_ text: String, chips: [String] = []) -> SearchResult {
+    // `calc` is the text's calculator answer when the caller already has it; `stale` ends a superseded query early
+    func build(_ text: String, chips: [String] = [], calc known: CalcResult?? = nil, stale: (() -> Bool)? = nil) -> SearchResult {
         if !chips.isEmpty { return chipHits(text, chips) }
         guard !text.isEmpty else { return SearchResult(hits: []) }
-        let fileQuery = FileQuery(text)
-        if fileQuery.explicit || Self.hasLiteralName(text, in: index) { return explicitFiles(fileQuery) }
+        let calc = known ?? Calc.answer(text)
+        let fileQuery = FileQuery(text, isCalc: calc != nil)
+        if fileQuery.explicit || Self.hasLiteralName(text, in: index) { return explicitFiles(fileQuery, stale: stale) }
         let ix = index
         let q = text.lowercased()
 
         var out: [Hit] = []
-        let calc = Calc.answer(text)
         if let c = calc {
             out.append(Hit(title: c.title, subtitle: c.detail + (c.copy.isEmpty ? "" : "  ·  ↩ copy"), icon: .symbol(Self.calcIcons[c.tag] ?? "equal.square"), tag: c.tag) { _ in
                 guard !c.copy.isEmpty else { return }
@@ -814,22 +1112,17 @@ final class Engine {
         // the sentence names what it is about ("my most recent screenshot", "my screen", "my clipboard")
         if calc == nil, let ref = Resolver.extract(text) { return refHits(ref, text) }
 
-        let (filters, rest) = calc == nil ? Filters.parse(text, folderExists: { name in
-            ix.folders.contains(name) || ix.entries.contains { $0.kind.isFile && $0.path.range(of: "/\(name)/", options: .caseInsensitive) != nil }
-        }) : (Filters(), q)
+        let (filters, rest) = calc == nil ? Filters.parse(text, folderExists: ix.hasFolder) : (Filters(), q)
         let learned = boosts(Self.norm(text))
 
         // intent pass: nearest exemplar per intent
         let iv = q.count >= 3 ? embedder?.query(q) : nil
+        if stale?() == true { return SearchResult(hits: []) }
         var best = [Float](repeating: -1, count: intents.count)
-        if let iv, !intentVecs.isEmpty {
-            intentVecs.withUnsafeBufferPointer { p in
-                for x in 0..<intentOf.count {
-                    var d: Float = 0
-                    for k in 0..<DIM { d += iv[k] * p[x * DIM + k] }
-                    best[intentOf[x]] = max(best[intentOf[x]], d)
-                }
-            }
+        if let iv, !intentVecs.isEmpty, intentVecs.count == intentOf.count * DIM {
+            var d = [Float](repeating: 0, count: intentOf.count)
+            vDSP_mmul(intentVecs, 1, iv, 1, &d, 1, vDSP_Length(intentOf.count), 1, vDSP_Length(DIM))
+            for x in 0..<intentOf.count { best[intentOf[x]] = max(best[intentOf[x]], d[x]) }
         }
         let fileSim = best.first ?? -1
         let rankedIntents = best.enumerated().dropFirst().sorted { $0.element > $1.element }
@@ -838,12 +1131,13 @@ final class Engine {
             if !filters.isEmpty { print("  filters: \(filters.notes.joined(separator: ", "))  rest: “\(rest)”") }
         }
 
-        // a typed app/file name always beats an inferred action
-        let qt = nameTokens(q)
-        let strongName = ix.entries.contains { e in
-            let l = lex(q, qt, e)
-            return l >= 0.9 || (l >= 0.7 && e.kind == .app)
-        }
+        // A typed app/file name always beats an inferred action. Only consulted for plain queries, whose
+        // ranking reads the text the same way, so that pass's name matches are reused when they agree.
+        let strongQuery = LexQuery(q, nameTokens(q)), rankQuery = LexQuery.ranking(rest)
+        let lexes = calc == nil && filters.isEmpty && strongQuery == rankQuery ? Self.lexes(rankQuery, ix) : nil
+        func strong(_ l: Float, _ e: Entry) -> Bool { l >= 0.9 || (l >= 0.7 && e.kind == .app) }
+        lazy var strongName: Bool = lexes.map { l in ix.entries.indices.contains { strong(l[$0], ix.entries[$0]) } }
+            ?? ix.entries.contains { strong(Self.lex(strongQuery, $0), $0) }
         var lead: [Hit] = [], trail: [Hit] = []
         var sawWeb = false
         for (n, r) in rankedIntents.prefix(3).enumerated() {
@@ -851,7 +1145,7 @@ final class Engine {
             // an action the user chose for this exact query before is what they mean now
             let chosen = learned["intent:" + it.id] ?? 0
             guard r.element >= 0.78 || chosen >= 3 else { continue }
-            let wins = chosen >= 3 || (n == 0 && r.element >= fileSim + 0.05 && !strongName && calc == nil && filters.isEmpty)
+            let wins = chosen >= 3 || (n == 0 && r.element >= fileSim + 0.05 && calc == nil && filters.isEmpty && !strongName)
             guard wins || r.element >= fileSim - 0.05 else { continue }
             if it.id == "web" { sawWeb = true }
             let made = it.hits(text).map { h -> Hit in
@@ -862,9 +1156,14 @@ final class Engine {
             if wins { lead += made } else { trail += made }
         }
 
+        // a row the command model will refine: have the model and its prompt ready by the time it is asked
+        if lead.contains(where: { $0.refine != nil }) || trail.contains(where: { $0.refine != nil }) { LLM.shared.preload() }
+
         // when an action or a computed answer already covers the query, only clearly related files are worth showing
         let gate: Float = lead.isEmpty ? 3.4 : 4.5
-        let ranked = rank(rest: rest, full: q, filters: filters, gate: gate, boosts: learned, nameOnly: calc != nil)
+        if stale?() == true { return SearchResult(hits: []) }
+        let ranked = rank(rest: rest, filters: filters, gate: gate, boosts: learned, nameOnly: calc != nil, lexes: lexes, stale: stale)
+        if stale?() == true { return SearchResult(hits: []) }
 
         // copies of one file collapse into its best-ranked instance
         let limit = SearchResult.fileLimit
@@ -890,11 +1189,11 @@ final class Engine {
             let entry = ix.entries[pair.0.i]
             return entry.kind.isFile && entry.kind != .folder && entry.kind != .app ? entry.path : nil
         })
-        lead = lead.map { $0.tag == "ChatGPT" ? Assistant.hit(text, files: contextFiles) : $0 }
-        trail = trail.map { $0.tag == "ChatGPT" ? Assistant.hit(text, files: contextFiles) : $0 }
-        let asksOutright = Calc.rx(q, "^(ask )?(chat ?gpt|gpt)\\b.+") != nil
-        if asksOutright || (calc == nil && !strongName && filters.isEmpty && Assistant.isComplex(q)), !lead.contains(where: { $0.tag == "ChatGPT" }) {
-            trail.removeAll { $0.tag == "ChatGPT" }
+        lead = lead.map { Assistant.isAsk($0) ? Assistant.hit(text, files: contextFiles) : $0 }
+        trail = trail.map { Assistant.isAsk($0) ? Assistant.hit(text, files: contextFiles) : $0 }
+        let asksOutright = Calc.rx(q, "^(ask )?(chat ?gpt|gpt|claude|gemini)\\b.+") != nil
+        if asksOutright || (calc == nil && filters.isEmpty && !strongName && Assistant.isComplex(q)), !lead.contains(where: Assistant.isAsk) {
+            trail.removeAll(where: Assistant.isAsk)
             lead.insert(Assistant.hit(text, files: contextFiles), at: 0)
         }
         out += lead
@@ -902,17 +1201,48 @@ final class Engine {
         out += kept.filter { !ix.entries[$0.0.i].kind.isFile }.map { hit($0.0, copies: $0.1) }
         out += trail
         // File searches expose their contextual Ask action without a separate attachment step.
-        if !out.contains(where: { $0.tag == "ChatGPT" }), (!contextFiles.isEmpty || q.split(separator: " ").count >= 3), calc == nil, !Self.launching(text, out) { out.append(Assistant.hit(text, files: contextFiles)) }
+        if !out.contains(where: Assistant.isAsk), (!contextFiles.isEmpty || q.split(separator: " ").count >= 3), calc == nil, !Self.launching(text, out) { out.append(Assistant.hit(text, files: contextFiles)) }
         if !sawWeb, q.count >= 2 { out.append(Actions.web(text)) }
         // Ask remains Ask. File operations are resolved before displaying an executable row.
-        return SearchResult(hits: out, note: filters.notes.isEmpty ? "" : "Filter: " + filters.notes.joined(separator: " · "))
+        var result = SearchResult(hits: out, note: filters.notes.isEmpty ? "" : "Filter: " + filters.notes.joined(separator: " · "))
+        if fileCount < limit, q.count >= 3, lead.isEmpty, calc == nil, filters.isEmpty { result.lookup = text }
+        return result
+    }
+
+    // File results past the first five, same ranking, for "show more". Delivered on the main queue.
+    func moreFiles(_ text: String, chips: [String] = [], limit: Int = 50, done: @escaping ([Hit]) -> Void) {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        queue.async {
+            var hits: [Hit] = []
+            if chips.isEmpty, !text.isEmpty {
+                let query = FileQuery(text), ix = self.index
+                var ranked: [Ranked] = []
+                if query.error != nil {
+                } else if query.pattern != nil {
+                    ranked = ix.entries.indices.filter { query.matches(ix.entries[$0]) }.sorted {
+                        let a = ix.entries[$0], b = ix.entries[$1]
+                        return a.mtime != b.mtime ? a.mtime > b.mtime : a.path < b.path
+                    }.map { Ranked(i: $0, score: 1, lex: 1, loc: 0, src: 0) }
+                } else if query.explicit || Self.hasLiteralName(text, in: ix) {
+                    ranked = self.rank(rest: query.text.lowercased(), filters: query.filters, gate: 3.4, boosts: self.boosts(Self.norm(query.text)),
+                                       contentOnly: query.contentOnly).filter { query.matches(ix.entries[$0.i]) }
+                } else if Calc.answer(text) == nil {
+                    let (filters, rest) = Filters.parse(text, folderExists: ix.hasFolder)
+                    ranked = self.rank(rest: rest, filters: filters, gate: 3.4, boosts: self.boosts(Self.norm(text)))
+                }
+                var seen = Set<String>()
+                hits = ranked.filter { ix.entries[$0.i].kind.isFile && seen.insert(ix.entries[$0.i].dupKey).inserted }
+                    .dropFirst(SearchResult.fileLimit).prefix(limit).map { self.hit($0, copies: 0) }
+            }
+            DispatchQueue.main.async { done(hits) }
+        }
     }
 
     // MARK: query by example
 
     private func mediaVector(_ path: String) -> [Float]? {
-        if let i = index.byPath[path] {
-            for r in 0..<index.rows where Int(index.rowEntry[r]) == i && Int(index.rowSrc[r]) == Src.media.rawValue { return index.vector(row: r) }
+        if let i = index.byPath[path], let r = index.rows(of: i).first(where: { Int(index.rowSrc[$0]) == Src.media.rawValue }) {
+            return index.vector(row: r)
         }
         // not indexed (pasted, or outside the indexed folders): ask a short-lived helper that has the encoders
         guard let exe = Bundle.main.executablePath else { return nil }
@@ -945,15 +1275,13 @@ final class Engine {
         for r in 0..<ix.rows where Int(ix.rowSrc[r]) == Src.media.rawValue {
             let e = Int(ix.rowEntry[r])
             guard allowed.contains(ix.entries[e].kind), ix.entries[e].path != path else { continue }
-            var squaredNorm: Float = 0
-            for k in 0..<DIM {
-                let component = Float(vecs[r * DIM + k])
-                squaredNorm += component * component
-            }
-            guard squaredNorm > 0 else { continue }
-            let cosine = raw[r] / (queryNorm * squaredNorm.squareRoot())
+            let norm = r < ix.rowNorm.count ? ix.rowNorm[r] : 0
+            guard norm > 0 else { continue }
+            let cosine = raw[r] / (queryNorm * norm)
             guard cosine.isFinite, cosine >= floor, cosine > (best[e]?.score ?? -1) else { continue }
-            best[e] = Ranked(i: e, score: min(1, cosine), lex: 0, loc: ix.rowLoc[r], src: Src.media.rawValue)
+            var x = Ranked(i: e, score: min(1, cosine), lex: 0, loc: ix.rowLoc[r], src: Src.media.rawValue)
+            x.why.similarity = cosine
+            best[e] = x
         }
         var seen = Set<String>()
         return Array(best.values.sorted {

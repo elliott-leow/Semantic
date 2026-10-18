@@ -61,10 +61,15 @@ final class LLM {
         ("Request: seafood restaurants near me", #"{"action":"none"}"#),
     ]
 
-    static func prompt(_ user: String) -> String {
+    // everything before the request; decoded once per model load and kept
+    static let prefix: String = {
         var p = "<|im_start|>system\n\(system)<|im_end|>\n"
         for (u, a) in shots { p += "<|im_start|>user\n\(u)<|im_end|>\n<|im_start|>assistant\n\(a)<|im_end|>\n" }
-        return p + "<|im_start|>user\n\(user)<|im_end|>\n<|im_start|>assistant\n"
+        return p + "<|im_start|>user\n"
+    }()
+
+    static func prompt(_ user: String) -> String {
+        prefix + "\(user)<|im_end|>\n<|im_start|>assistant\n"
     }
 
     func commandSync(_ request: String, file: String?) -> [String: Any]? {
@@ -78,10 +83,19 @@ final class LLM {
         }
     }
 
-    private func run(_ request: String, file: String?) -> [String: Any]? {
+    // Loads the model and decodes the fixed prompt in the background, so the first command is quick.
+    // Call it when the typed text starts to look like a command.
+    func preload() {
+        guard Self.available else { return }
+        queue.async { _ = self.load() }
+    }
+
+    private func load() -> OpaquePointer? {
         unload?.cancel()
-        if ctx == nil { ctx = sb_llm_init(Self.path, 2048) }
-        guard let ctx else { return nil }
+        if ctx == nil, let c = sb_llm_init(Self.path, 2048) {
+            ctx = c
+            if sb_llm_cache_prefix(c, Self.prefix) < 0 { log("command model: prompt prefix not cached") }
+        }
         let w = DispatchWorkItem { [weak self] in
             guard let self, let c = self.ctx else { return }
             sb_llm_free(c)
@@ -89,6 +103,11 @@ final class LLM {
         }
         unload = w
         queue.asyncAfter(deadline: .now() + 90, execute: w)
+        return ctx
+    }
+
+    private func run(_ request: String, file: String?) -> [String: Any]? {
+        guard let ctx = load() else { return nil }
 
         let user = (file.map { "File: \(($0 as NSString).lastPathComponent)\n" } ?? "") + "Request: \(request)"
         // a request identical to one of the examples confuses a small model; the answer is already known

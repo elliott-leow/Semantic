@@ -7,8 +7,11 @@ struct Filters {
     var softKinds: Set<Kind> = []
     var after: Double?
     var before: Double?
-    var pathPrefix: String?
-    var folder: String?
+    var pathPrefix: String? { didSet { prefixKey = pathPrefix.map(Self.prefixKey) } }
+    var folder: String? { didSet { folderKey = folder.map { "/" + $0 + "/" } } }
+    // worked out once per query, not per entry
+    private var prefixKey: (absolute: Bool, key: String)?
+    private var folderKey: String?
     var minSize: Int?
     var maxSize: Int?
     var notes: [String] = []     // shown under the bar so the user sees what was understood
@@ -20,21 +23,22 @@ struct Filters {
         if let kinds, !kinds.contains(e.kind) { return false }
         if let after, e.mtime < after { return false }
         if let before, e.mtime >= before { return false }
-        if let pathPrefix {
-            let path = e.path.lowercased()
-            let expanded = (pathPrefix as NSString).expandingTildeInPath
-            if expanded.hasPrefix("/") {
-                let prefix = URL(fileURLWithPath: expanded).standardizedFileURL.path.lowercased()
-                if !path.hasPrefix(prefix == "/" ? "/" : prefix + "/") { return false }
-            } else {
-                let prefix = expanded.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                if !path.contains("/" + prefix + "/") { return false }
-            }
+        if let prefixKey {
+            if prefixKey.absolute ? !e.lpath.hasPrefix(prefixKey.key) : !e.lpath.contains(prefixKey.key) { return false }
         }
-        if let folder, e.path.range(of: "/" + folder + "/", options: .caseInsensitive) == nil { return false }
+        if let folderKey, e.path.range(of: folderKey, options: .caseInsensitive) == nil { return false }
         if let minSize, e.size < minSize { return false }
         if let maxSize, e.size > maxSize || e.size == 0 { return false }
         return true
+    }
+
+    private static func prefixKey(_ pathPrefix: String) -> (absolute: Bool, key: String) {
+        let expanded = (pathPrefix as NSString).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            let prefix = URL(fileURLWithPath: expanded).standardizedFileURL.path.lowercased()
+            return (true, prefix == "/" ? "/" : prefix + "/")
+        }
+        return (false, "/" + expanded.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/")
     }
 
     static let extWords: [String: [String]] = [
