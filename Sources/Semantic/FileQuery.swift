@@ -10,6 +10,8 @@ struct FileQuery {
     var explicit = false
     var contentOnly = false
 
+    private static let filterRE = try! NSRegularExpression(pattern: #"(?:^|\s)(ext|in|type):(?:"([^"\n]+)"|(\S+))"#, options: [.caseInsensitive])
+
     // `isCalc`: whether the input is arithmetic, when the caller already knows
     init(_ input: String, isCalc: Bool? = nil) {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -22,8 +24,7 @@ struct FileQuery {
             break
         }
         // Small explicit filters compose with names, descriptions and grep text.
-        let filterRE = try! NSRegularExpression(pattern: #"(?:^|\s)(ext|in|type):(?:"([^"\n]+)"|(\S+))"#, options: [.caseInsensitive])
-        let matches = filterRE.matches(in: text, range: NSRange(text.startIndex..., in: text))
+        let matches = Self.filterRE.matches(in: text, range: NSRange(text.startIndex..., in: text))
         for match in matches.reversed() {
             let ns = text as NSString
             let key = ns.substring(with: match.range(at: 1)).lowercased()
@@ -80,8 +81,8 @@ struct FileQuery {
         }
         if let expression {
             if expression.isEmpty { error = "Enter a search pattern"; return }
-            do { pattern = try NSRegularExpression(pattern: expression, options: [.caseInsensitive]) }
-            catch { self.error = "Invalid search pattern" }
+            pattern = Rx.get(expression, [.caseInsensitive])
+            if pattern == nil { error = "Invalid search pattern" }
         }
     }
 

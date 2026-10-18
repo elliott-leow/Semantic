@@ -34,10 +34,8 @@ enum WindowSwitcher {
     }
 
     static func query(_ text: String) -> String {
-        text.lowercased()
-            .replacingOccurrences(of: "^(switch|go|jump|change)( over)? to |^(focus|show|bring up|raise|activate)\\s+", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "\\b(the|my|window|windows|app)\\b", with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+        let t = Rx.replace(text.lowercased(), "^(switch|go|jump|change)( over)? to |^(focus|show|bring up|raise|activate)\\s+", "")
+        return Rx.replace(Rx.replace(t, "\\b(the|my|window|windows|app)\\b", " "), "\\s+", " ").trimmingCharacters(in: .whitespaces)
     }
 
     // every query word must start a word of the app name or the title
@@ -89,9 +87,8 @@ enum AppQuitter {
     static func parse(_ text: String) -> (name: String, force: Bool) {
         let t = text.lowercased().trimmingCharacters(in: .whitespaces)
         let force = Calc.rx(t, "^(force[ -]?quit|force[ -]?close|kill)\\b.*") != nil
-        let name = t.replacingOccurrences(of: "^(force[ -]?quit|force[ -]?close|kill|quit|close|exit)\\s+", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "\\b(the|app|application|all|frozen|stuck)\\b", with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+        let name = Rx.replace(Rx.replace(Rx.replace(t, "^(force[ -]?quit|force[ -]?close|kill|quit|close|exit)\\s+", ""),
+                                         "\\b(the|app|application|all|frozen|stuck)\\b", " "), "\\s+", " ").trimmingCharacters(in: .whitespaces)
         return (name, force)
     }
 
@@ -143,9 +140,7 @@ enum Shortcuts {
     }
 
     static func query(_ text: String) -> String {
-        text.lowercased()
-            .replacingOccurrences(of: "^(run|start|do|launch|open)( the| my)? (shortcut|shortcuts)( called| named)?\\s*|^(shortcut|shortcuts)\\s+|\\s+shortcut$", with: "",
-                                  options: .regularExpression)
+        Rx.replace(text.lowercased(), "^(run|start|do|launch|open)( the| my)? (shortcut|shortcuts)( called| named)?\\s*|^(shortcut|shortcuts)\\s+|\\s+shortcut$", "")
             .trimmingCharacters(in: .whitespaces)
     }
 

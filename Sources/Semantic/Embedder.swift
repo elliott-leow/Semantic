@@ -4,13 +4,18 @@ import Foundation
 // Not thread-safe: each owner calls it from one serial queue.
 final class Embedder {
     private let ctx: OpaquePointer
-    private var queryCache: [String: [Float]] = [:]
-    private var queryOrder: [String] = []
+    // A query's vector depends only on the text and the model, so it outlives an unloaded model.
+    // Shared by every embedder of one configuration; the model loads on another queue, hence the lock.
+    private static var queryCache: [String: [Float]] = [:]
+    private static var queryOrder: [String: [String]] = [:]
+    private static let queryLock = NSLock()
+    private let model: String
 
     init?(multimodal: Bool, nCtx: Int32) {
         guard FileManager.default.fileExists(atPath: Paths.model),
               let c = sb_init(Paths.model, multimodal ? Paths.mmproj : nil, nCtx, 1) else { return nil }
         ctx = c
+        model = "\(Paths.model)|\(multimodal)|\(nCtx)|"
     }
 
     deinit { sb_free(ctx) }
@@ -21,11 +26,19 @@ final class Embedder {
     }
 
     func query(_ q: String) -> [Float]? {
-        if let cached = queryCache[q] { return cached }
+        let key = model + q
+        Self.queryLock.lock()
+        let cached = Self.queryCache[key]
+        Self.queryLock.unlock()
+        if let cached { return cached }
         guard let vector = text("task: search result | query: " + q) else { return nil }
-        if queryOrder.count >= 128 { queryCache.removeValue(forKey: queryOrder.removeFirst()) }
-        queryOrder.append(q)
-        queryCache[q] = vector
+        Self.queryLock.lock()
+        defer { Self.queryLock.unlock() }
+        if Self.queryCache[key] == nil {
+            if Self.queryOrder[model, default: []].count >= 128 { Self.queryCache.removeValue(forKey: Self.queryOrder[model, default: []].removeFirst()) }
+            Self.queryOrder[model, default: []].append(key)
+            Self.queryCache[key] = vector
+        }
         return vector
     }
 

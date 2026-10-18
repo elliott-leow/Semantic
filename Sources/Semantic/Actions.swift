@@ -38,11 +38,30 @@ struct Intent {
 }
 
 enum Sys {
-    static func app(_ bundleID: String) -> URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) }
+    // Launch Services lookups run on every keystroke; remembered briefly, so a newly installed app or
+    // a changed default browser still shows up within half a minute.
+    private static let lookupLock = NSLock()
+    private static var apps: [String: (URL?, Date)] = [:]
+    private static var browser: (String, Date)?
+
+    static func app(_ bundleID: String) -> URL? {
+        lookupLock.lock()
+        if let (u, t) = apps[bundleID], Date().timeIntervalSince(t) < 30 { lookupLock.unlock(); return u }
+        lookupLock.unlock()
+        let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        lookupLock.lock(); apps[bundleID] = (u, Date()); lookupLock.unlock()
+        return u
+    }
 
     static var browserName: String {
-        guard let u = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!) else { return "browser" }
-        return FileManager.default.displayName(atPath: u.path).replacingOccurrences(of: ".app", with: "")
+        lookupLock.lock()
+        if let (n, t) = browser, Date().timeIntervalSince(t) < 30 { lookupLock.unlock(); return n }
+        lookupLock.unlock()
+        let n = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!).map {
+            FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "")
+        } ?? "browser"
+        lookupLock.lock(); browser = (n, Date()); lookupLock.unlock()
+        return n
     }
 
     static func open(_ s: String) {
@@ -92,7 +111,7 @@ enum Sys {
 
 enum Actions {
     static func strip(_ q: String, _ pattern: String) -> String {
-        let s = q.replacingOccurrences(of: pattern, with: "", options: [.regularExpression, .caseInsensitive])
+        let s = Rx.replace(q, pattern, "", .caseInsensitive)
         let t = s.trimmingCharacters(in: .whitespaces)
         return t.isEmpty ? q : t
     }
