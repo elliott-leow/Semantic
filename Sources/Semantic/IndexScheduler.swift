@@ -1,13 +1,41 @@
 import AppKit
 
+// Scheduler state; AppDelegate is an extension here, so it lives beside it (main thread only).
+private enum Watch {
+    static var dirs = Set<String>()   // folders with changed entries since the last run started
+    static var rescan = false         // FSEvents lost track (dropped events, root moved): walk everything
+    static var timer: Timer?          // the one pending debounce
+    static var roots: [String] = []
+    static var home: DispatchSourceFileSystemObject?
+    static var store: Store?          // one read-only connection for progress polling
+    static let maxDirs = 400          // beyond this a full walk is cheaper than listing each folder
+}
+
 // When the indexer child process runs, and how the bar learns about its progress.
 extension AppDelegate {
-    func startIndexer() {
-        guard indexer == nil, let exe = Bundle.main.executablePath else { pendingIndex = indexer != nil; return }
+    // nil paths: full walk of every root (launch, hourly). Paths: rescan only those folders.
+    func startIndexer(paths: [String]? = nil) {
+        guard !indexingPaused, let exe = Bundle.main.executablePath else { return }
+        guard indexer == nil else {
+            // a full request waits for the current run; changed folders are still in Watch.dirs
+            if paths == nil { pendingIndex = true }
+            return
+        }
+        var args = ["--index"]
+        if let paths {
+            let list = Paths.tmp + "/changed-folders.txt"
+            guard (try? paths.joined(separator: "\n").write(toFile: list, atomically: true, encoding: .utf8)) != nil else {
+                startIndexer()
+                return
+            }
+            args += ["--paths", list]
+        }
+        Watch.dirs.removeAll()
+        Watch.rescan = false
         lastIndexRun = Date()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: exe)
-        p.arguments = ["--index"]
+        p.arguments = args
         p.qualityOfService = .utility
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
@@ -17,34 +45,86 @@ extension AppDelegate {
                 self.bar.status = ""
                 Engine.shared.reloadIndex()
                 if self.pendingIndex { self.pendingIndex = false; self.startIndexer() }
+                else if Watch.rescan || !Watch.dirs.isEmpty { self.scheduleChangedRun() }
             }
         }
         guard (try? p.run()) != nil else { return }
         indexer = p
         ticks = 0
         progressTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            guard let self, let s = Store(readonly: true)?.metaString("progress") else { return }
+            if Watch.store == nil { Watch.store = Store(readonly: true) }
+            guard let self, let s = Watch.store?.metaString("progress") else { return }
             self.bar.status = "Indexing \(s)"
             self.ticks += 1
             if self.ticks == 1 || self.ticks % 8 == 0 { Engine.shared.reloadIndex() } // surface new results while indexing
         }
     }
 
-    func watchFiles() {
-        let roots = Indexer.roots() as CFArray
-        let cb: FSEventStreamCallback = { _, _, _, _, _, _ in
-            DispatchQueue.main.async {
-                guard let d = AppDelegate.shared else { return }
-                let wait = max(0, 60 - Date().timeIntervalSince(d.lastIndexRun))
-                DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
-                    if Date().timeIntervalSince(d.lastIndexRun) >= 60 { d.startIndexer() }
-                }
-            }
+    // One debounce for every batch of events: at least 5 s, and runs start at most once a minute.
+    private func scheduleChangedRun() {
+        guard Watch.timer == nil else { return }
+        let wait = max(5, 60 - Date().timeIntervalSince(lastIndexRun))
+        Watch.timer = Timer.scheduledTimer(withTimeInterval: wait, repeats: false) { [weak self] _ in
+            Watch.timer = nil
+            guard let self, self.indexer == nil else { return } // the termination handler reschedules
+            if Watch.rescan || Watch.dirs.count > Watch.maxDirs { self.startIndexer() }
+            else if !Watch.dirs.isEmpty { self.startIndexer(paths: Watch.dirs.sorted()) }
         }
-        guard let s = FSEventStreamCreate(nil, cb, nil, roots, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 15,
-                                          FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone)) else { return }
+    }
+
+    fileprivate func filesChanged(_ dirs: [String], rescan: Bool) {
+        if rescan { Watch.rescan = true }
+        Watch.dirs.formUnion(dirs)
+        if Watch.rescan || !Watch.dirs.isEmpty { scheduleChangedRun() }
+    }
+
+    func watchFiles() {
+        if let s = stream {
+            FSEventStreamStop(s)
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+            stream = nil
+        }
+        let roots = Indexer.roots()
+        Watch.roots = roots
+        watchHome()
+        let cb: FSEventStreamCallback = { _, _, n, paths, flags, _ in
+            // kFSEventStreamCreateFlagUseCFTypes: the paths are a CFArray of CFString
+            let list = unsafeBitCast(paths, to: NSArray.self) as? [String] ?? []
+            let lost = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped |
+                                               kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagRootChanged)
+            var dirs: [String] = [], rescan = false
+            for i in 0..<min(n, list.count) {
+                if flags[i] & lost != 0 { rescan = true; continue }
+                let p = list[i]
+                // a file event names the item; its folder is what gets listed again
+                guard !Indexer.ignorable(p, roots: Watch.roots) else { continue }
+                let dir = (p as NSString).deletingLastPathComponent
+                dirs.append(Watch.roots.contains(p) ? p : dir)
+            }
+            AppDelegate.shared?.filesChanged(dirs, rescan: rescan)
+        }
+        let flags = kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents
+        guard let s = FSEventStreamCreate(nil, cb, nil, roots as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 5,
+                                          FSEventStreamCreateFlags(flags)) else { return }
         FSEventStreamSetDispatchQueue(s, .main)
         FSEventStreamStart(s)
         stream = s
+    }
+
+    // Default roots are the visible folders in ~: a new or removed one re-creates the stream and walks everything.
+    private func watchHome() {
+        guard config.roots == nil, Watch.home == nil else { return }
+        let fd = open(Paths.home, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
+        src.setEventHandler { [weak self] in
+            guard let self, Indexer.roots() != Watch.roots else { return }
+            self.watchFiles()
+            self.startIndexer()
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        Watch.home = src
     }
 }

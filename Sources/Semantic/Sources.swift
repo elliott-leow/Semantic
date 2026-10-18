@@ -1,4 +1,5 @@
 import Contacts
+import CryptoKit
 import EventKit
 import Foundation
 import SQLite3
@@ -20,7 +21,8 @@ enum Sources {
         // browsers keep their databases locked, so query a private copy
         let fm = FileManager.default
         guard fm.fileExists(atPath: dbPath) else { return nil }
-        let copy = Paths.tmp + "/src-\(abs(dbPath.hashValue)).sqlite"
+        // a stable name: String.hashValue is seeded per process, which left a copy behind on every crash
+        let copy = Paths.tmp + "/src-" + SHA256.hash(data: Data(dbPath.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined() + ".sqlite"
         for suffix in ["", "-wal"] {
             try? fm.removeItem(atPath: copy + suffix)
             try? fm.copyItem(atPath: dbPath + suffix, toPath: copy + suffix)
@@ -40,16 +42,55 @@ enum Sources {
         return out
     }
 
+    static let support = Paths.home + "/Library/Application Support"
+    static let chromium = ["Google/Chrome", "BraveSoftware/Brave-Browser", "Microsoft Edge", "Arc/User Data", "Vivaldi",
+                           "com.operasoftware.Opera", "Dia/User Data"]
+    static let firefox = ["Firefox/Profiles", "zen/Profiles"]
+
+    // Chromium profile folders: Default and Profile N; Opera keeps its files in the base folder itself
+    static func chromiumProfiles() -> [String] {
+        let fm = FileManager.default
+        return chromium.flatMap { b -> [String] in
+            let base = support + "/" + b
+            let names = ((try? fm.contentsOfDirectory(atPath: base)) ?? []).filter { $0 == "Default" || $0.hasPrefix("Profile ") }.sorted()
+            return (fm.fileExists(atPath: base + "/History") ? [base] : []) + names.map { base + "/" + $0 }
+        }
+    }
+
+    static func firefoxProfiles() -> [String] {
+        firefox.flatMap { f -> [String] in
+            let dir = support + "/" + f
+            return ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).sorted().map { dir + "/" + $0 }
+        }
+    }
+
+    static let orionHistory = support + "/Orion/Defaults/history"
+    static let safariHistory = Paths.home + "/Library/Safari/History.db"
+    static let safariBookmarks = Paths.home + "/Library/Safari/Bookmarks.plist"
+
+    // every file web() reads; their mtimes tell the indexer whether a re-read can find anything new
+    static func webFiles() -> [String] {
+        chromiumProfiles().flatMap { [$0 + "/History", $0 + "/Bookmarks"] } + firefoxProfiles().map { $0 + "/places.sqlite" } +
+            [orionHistory, safariHistory, safariBookmarks]
+    }
+
+    static func webSignature() -> String {
+        let fm = FileManager.default
+        return webFiles().flatMap { [$0, $0 + "-wal"] }.compactMap { p -> String? in
+            guard let m = (try? fm.attributesOfItem(atPath: p))?[.modificationDate] as? Date else { return nil }
+            return "\(p):\(Int(m.timeIntervalSince1970))"
+        }.joined(separator: "\n")
+    }
+
     // browser history and bookmarks, most-used first
     static func web() -> [Item]? {
         guard enabled("web") else { return [] }
         var found: [(String, String, Double)] = [] // url, title, last visit
         var readable = false
-        let support = Paths.home + "/Library/Application Support"
+        let fm = FileManager.default
 
-        let profiles = support + "/Firefox/Profiles"
-        for p in (try? FileManager.default.contentsOfDirectory(atPath: profiles)) ?? [] {
-            let db = profiles + "/" + p + "/places.sqlite"
+        for profile in firefoxProfiles() {
+            let db = profile + "/places.sqlite"
             if let r = rows(db, """
             SELECT p.url, COALESCE(b.title, p.title), COALESCE(p.last_visit_date, 0) / 1000000
             FROM moz_bookmarks b JOIN moz_places p ON p.id = b.fk WHERE b.type = 1
@@ -59,9 +100,8 @@ enum Sources {
             WHERE title IS NOT NULL AND title != '' AND hidden = 0 ORDER BY frecency DESC LIMIT 2500
             """) { readable = true; found += r.map { ($0[0], $0[1], Double($0[2]) ?? 0) } }
         }
-        for browser in ["Google/Chrome", "BraveSoftware/Brave-Browser", "Microsoft Edge", "Arc/User Data"] {
-            let dir = support + "/" + browser + "/Default"
-            if let d = FileManager.default.contents(atPath: dir + "/Bookmarks"),
+        for dir in chromiumProfiles() {
+            if let d = fm.contents(atPath: dir + "/Bookmarks"),
                let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
                 readable = true
                 func walk(_ node: Any?) {
@@ -76,11 +116,20 @@ enum Sources {
             WHERE title != '' ORDER BY visit_count DESC, last_visit_time DESC LIMIT 2000
             """) { readable = true; found += r.map { ($0[0], $0[1], Double($0[2]) ?? 0) } }
         }
-        // needs Full Disk Access; silently absent without it
-        if let r = rows(Paths.home + "/Library/Safari/History.db", """
+        // Orion (WebKit) keeps a Safari-like history_items table; its schema is not documented, so a mismatch reads nothing
+        if let r = rows(orionHistory, """
+        SELECT url, title, 0 FROM history_items WHERE title IS NOT NULL AND title != '' ORDER BY visit_count DESC LIMIT 2000
+        """) { readable = true; found += r.map { ($0[0], $0[1], Double($0[2]) ?? 0) } }
+        // Safari needs Full Disk Access; silently absent without it
+        if let r = rows(safariHistory, """
         SELECT i.url, v.title, MAX(v.visit_time) + 978307200 FROM history_items i JOIN history_visits v ON v.history_item = i.id
         WHERE v.title IS NOT NULL AND v.title != '' GROUP BY i.id ORDER BY i.visit_count DESC LIMIT 2000
         """) { readable = true; found += r.map { ($0[0], $0[1], Double($0[2]) ?? 0) } }
+        if let d = fm.contents(atPath: safariBookmarks),
+           let plist = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] {
+            readable = true
+            found += safariBookmarkList(plist).map { ($0.0, $0.1, 0) }
+        }
 
         guard readable else { return nil }
         var seenURL = Set<String>(), seenTitle = Set<String>()
@@ -94,6 +143,14 @@ enum Sources {
             if out.count >= 4000 { break }
         }
         return out
+    }
+
+    static func safariBookmarkList(_ node: [String: Any]) -> [(String, String)] {
+        if let u = node["URLString"] as? String {
+            let title = (node["URIDictionary"] as? [String: Any])?["title"] as? String ?? ""
+            return [(u, title)]
+        }
+        return (node["Children"] as? [[String: Any]] ?? []).flatMap(safariBookmarkList)
     }
 
     static let eventDate: DateFormatter = {
