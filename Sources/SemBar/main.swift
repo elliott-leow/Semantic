@@ -1,0 +1,363 @@
+import AppKit
+import Carbon.HIToolbox
+import Contacts
+import EventKit
+import ServiceManagement
+import SQLite3
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    static var shared: AppDelegate?
+
+    var bar: BarController!
+    private var clipCount = NSPasteboard.general.changeCount
+    private var indexer: Process?
+    private var lastIndexRun = Date.distantPast
+    private var pendingIndex = false
+    private var progressTimer: Timer?
+    private var unloadTimer: Timer?
+    private var hotKey: EventHotKeyRef?
+    private var stream: FSEventStreamRef?
+    private var ticks = 0
+    private var frontApp: (path: String, since: Date)?
+    private var settledApp: String?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
+        let me = NSRunningApplication.current
+        if let id = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: id).contains(where: { $0 != me }) {
+            NSApp.terminate(nil)
+            return
+        }
+
+        bar = BarController()
+        bar.onHide = { [weak self] in self?.scheduleUnload() }
+        Engine.shared.onChange = { [weak self] in
+            guard let self, self.bar.isVisible else { return }
+            self.bar.refresh()
+        }
+        Rates.onUpdate = { Engine.shared.onChange?() }
+        Engine.shared.reloadIndex()
+        registerHotKey()
+        watchFiles()
+        startIndexer()
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in self?.startIndexer() }
+        watchClipboard()
+        watchApps()
+        askForSources()
+
+        if !FileManager.default.fileExists(atPath: Paths.model) { bar.status = "Model not found — run ./build.sh to download it" }
+
+        // once only, so turning it off in System Settings sticks
+        if Bundle.main.bundlePath.hasSuffix(".app"), !UserDefaults.standard.bool(forKey: "loginItemRegistered") {
+            UserDefaults.standard.set(true, forKey: "loginItemRegistered")
+            try? SMAppService.mainApp.register()
+        }
+    }
+
+    // skip static destructors: Metal asserts if a context is still alive at exit()
+    func applicationWillTerminate(_ notification: Notification) {
+        Habits.shared.flush()
+        _exit(0)
+    }
+
+    // `open -a SemBar` while running shows the bar
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !bar.isVisible { toggle() }
+        return false
+    }
+
+    func toggle() {
+        if bar.isVisible { bar.hide(); return }
+        unloadTimer?.invalidate()
+        Engine.shared.warm()
+        bar.show()
+    }
+
+    // Calendar and Contacts are asked for once; the indexer only reads what was granted
+    private func askForSources() {
+        guard Bundle.main.bundlePath.hasSuffix(".app"), !UserDefaults.standard.bool(forKey: "askedSources") else { return }
+        UserDefaults.standard.set(true, forKey: "askedSources")
+        let again = { DispatchQueue.main.async { self.pendingIndex = true; self.startIndexer() } }
+        let contacts = { if Sources.enabled("contacts") { CNContactStore().requestAccess(for: .contacts) { _, _ in again() } } }
+        if Sources.enabled("calendar") { Commands.store.requestFullAccessToEvents { _, _ in contacts() } } else { contacts() }
+    }
+
+    // App switches teach the habit model what is used when and after what. An app only counts once it has
+    // been in front for a few seconds, so passing through apps with ⌘⇥ teaches nothing.
+    private func watchApps() {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
+            guard let self, let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app != NSRunningApplication.current, let path = app.bundleURL?.path else { return }
+            let now = Date()
+            if let prev = self.frontApp, now.timeIntervalSince(prev.since) >= 3 {
+                Habits.shared.recordActivation(prev.path, from: self.settledApp)
+                self.settledApp = prev.path
+            }
+            self.frontApp = (path, now)
+        }
+    }
+
+    private func watchClipboard() {
+        guard config.clipboard != false else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.pollClipboard() }
+        t.tolerance = 0.5
+    }
+
+    private func pollClipboard() {
+        let pb = NSPasteboard.general
+        guard pb.changeCount != clipCount else { return }
+        clipCount = pb.changeCount
+        // password managers mark secrets with these types; never keep those
+        let secret = ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "org.nspasteboard.AutoGeneratedType", "com.agilebits.onepassword"]
+        if (pb.types ?? []).contains(where: { secret.contains($0.rawValue) }) { return }
+        guard let s = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), s.count >= 3, s.count <= 20000 else { return }
+        var h: UInt64 = 5381
+        for b in s.utf8 { h = h &* 33 &+ UInt64(b) }
+        let key = "clip:\(h)", now = Date().timeIntervalSince1970
+        let name = String((s.split(separator: "\n").first ?? "").prefix(80))
+        ioQueue.async {
+            guard let store = Store() else { return }
+            var old: [Int64] = []
+            store.run("SELECT id FROM files WHERE path = ?", [key]) { old.append(sqlite3_column_int64($0, 0)) }
+            store.run("SELECT id FROM files WHERE kind = ? ORDER BY mtime DESC LIMIT -1 OFFSET 199", [Kind.clip.rawValue]) { old.append(sqlite3_column_int64($0, 0)) }
+            for id in old { store.deleteFile(id) }
+            // state 2: the bar embeds it the next time the text model is loaded
+            store.run("INSERT INTO files(path,name,kind,mtime,size,state,snippet) VALUES(?,?,?,?,?,2,?)",
+                      [key, name, Kind.clip.rawValue, now, s.count, s])
+        }
+    }
+
+    // the text model is only resident while the bar is in use
+    private func scheduleUnload() {
+        unloadTimer?.invalidate()
+        unloadTimer = Timer.scheduledTimer(withTimeInterval: config.unloadAfter ?? 300, repeats: false) { _ in Engine.shared.unload() }
+    }
+
+    private func registerHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { AppDelegate.shared?.toggle() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        let id = EventHotKeyID(signature: OSType(0x53454D42), id: 1) // 'SEMB'
+        let rc = RegisterEventHotKey(UInt32(kVK_ANSI_Y), UInt32(cmdKey), id, GetApplicationEventTarget(), 0, &hotKey)
+        if rc != noErr { log("could not register cmd+Y (\(rc))") }
+    }
+
+    func startIndexer() {
+        guard indexer == nil, let exe = Bundle.main.executablePath else { pendingIndex = indexer != nil; return }
+        lastIndexRun = Date()
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = ["--index"]
+        p.qualityOfService = .utility
+        p.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.indexer = nil
+                self.progressTimer?.invalidate()
+                self.bar.status = ""
+                Engine.shared.reloadIndex()
+                if self.pendingIndex { self.pendingIndex = false; self.startIndexer() }
+            }
+        }
+        guard (try? p.run()) != nil else { return }
+        indexer = p
+        ticks = 0
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            guard let self, let s = Store(readonly: true)?.metaString("progress") else { return }
+            self.bar.status = "Indexing \(s)"
+            self.ticks += 1
+            if self.ticks == 1 || self.ticks % 8 == 0 { Engine.shared.reloadIndex() } // surface new results while indexing
+        }
+    }
+
+    private func watchFiles() {
+        let roots = Indexer.roots() as CFArray
+        let cb: FSEventStreamCallback = { _, _, _, _, _, _ in
+            DispatchQueue.main.async {
+                guard let d = AppDelegate.shared else { return }
+                let wait = max(0, 60 - Date().timeIntervalSince(d.lastIndexRun))
+                DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
+                    if Date().timeIntervalSince(d.lastIndexRun) >= 60 { d.startIndexer() }
+                }
+            }
+        }
+        guard let s = FSEventStreamCreate(nil, cb, nil, roots, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 15,
+                                          FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone)) else { return }
+        FSEventStreamSetDispatchQueue(s, .main)
+        FSEventStreamStart(s)
+        stream = s
+    }
+}
+
+#if SEARCH_TESTS
+SearchTests.run()
+#else
+let args = CommandLine.arguments
+if args.contains("--index") {
+    exit(Indexer.run(full: args.contains("--full"), namesOnly: args.contains("--names-only")))
+}
+if let i = args.firstIndex(of: "--embed"), i + 1 < args.count {
+    // helper for "find similar": one media vector on stdout
+    func embed(_ path: String) -> [Float]? {
+        let url = URL(fileURLWithPath: path)
+        guard let emb = Embedder(multimodal: true, nCtx: 1024) else { return nil }
+        switch Extract.kind(ext: url.pathExtension.lowercased()) {
+        case .audio: return Extract.audioSegments(url, max: 1).first.flatMap { emb.audio($0.1) }
+        case .video: return Extract.videoFrames(url, max: 1).first.flatMap { emb.image($0.1) }
+        default: return Extract.image(url, maxPixel: 896).flatMap { emb.image($0) }
+        }
+    }
+    let v = embed(args[i + 1])
+    print((v ?? []).map { String($0) }.joined(separator: ","))
+    fflush(stdout)
+    _exit(v == nil ? 1 : 0)
+}
+if let i = args.firstIndex(of: "--do") {
+    // debugging aid: "path[,path]|request" -> run the first matching file operation and print what it made
+    _ = NSApplication.shared
+    Engine.shared.reloadIndex()
+    Engine.shared.sync {}
+    var left = args.count - i - 1
+    for q in args[(i + 1)...] {
+        let parts = q.split(separator: "|", maxSplits: 1).map(String.init)
+        let files = parts[0].split(separator: ",").map(String.init)
+        DispatchQueue.global().async {
+            var op = FileOps.parse(parts[1], files).first
+            var via = "rules"
+            if op == nil, let j = LLM.shared.commandSync(parts[1], file: files.first) { op = FileOps.from(j, files); via = "model \(j)" }
+            var line = "\(parts[1])  ->  \(op?.title ?? "no action")  [\(via)]"
+            if let work = op?.work {
+                do { line += "\n    made: " + (try work()).map { Paths.tilde($0) }.joined(separator: ", ") } catch { line += "\n    error: \(error.localizedDescription)" }
+            }
+            DispatchQueue.main.async { print(line); left -= 1 }
+        }
+        while left > args.count - i - 1 - (args[(i + 1)...].firstIndex(of: q)! - i) { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    }
+    fflush(stdout)
+    _exit(0)
+}
+if let i = args.firstIndex(of: "--similar"), i + 1 < args.count {
+    // debugging aid: what "find similar" returns for a file
+    Engine.shared.reloadIndex()
+    var done = false
+    Engine.shared.similar(to: args[i + 1]) { r in
+        print(r.note)
+        for h in r.hits { print(String(format: "  %.3f  %@   — %@", h.score, h.title, h.subtitle)) }
+        done = true
+    }
+    while !done { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    fflush(stdout)
+    _exit(0)
+}
+if let i = args.firstIndex(of: "--llm") {
+    // debugging aid: "request" or "file.ext|request" -> parsed command
+    for q in args[(i + 1)...] {
+        let parts = q.split(separator: "|", maxSplits: 1).map(String.init)
+        let t = Date()
+        let r = LLM.shared.commandSync(parts.last!, file: parts.count > 1 ? parts[0] : nil)
+        let json = r.flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys]) }.flatMap { String(data: $0, encoding: .utf8) } ?? "nil"
+        print("\(q)\n    \(json)   (\(Int(Date().timeIntervalSince(t) * 1000)) ms)")
+    }
+    LLM.shared.free()
+    fflush(stdout)
+    _exit(0)
+}
+if let i = args.firstIndex(of: "--calc") {
+    // debugging aid: calculator answers only, no model
+    _ = Rates.current()
+    Thread.sleep(forTimeInterval: 1.5)
+    for q in args[(i + 1)...] {
+        let r = Calc.answer(q)
+        print(String(format: "%-44@ %@", q as NSString, (r.map { "\($0.title)   [\($0.detail)]" } ?? "—") as NSString))
+    }
+    exit(0)
+}
+if args.contains("--suggest") {
+    // debugging aid: what the empty bar would offer now, and the habit strength behind each row
+    Engine.shared.reloadIndex()
+    var done = false
+    Engine.shared.search("") { r in
+        for h in r.hits { print(String(format: "  %5.2f  %-11@ %@", h.score, h.tag, h.title)) }
+        if r.hits.isEmpty { print("  (nothing learned yet)") }
+        done = true
+    }
+    while !done { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    fflush(stdout)
+    _exit(0)
+}
+if let i = args.firstIndex(of: "--query-latency") {
+    // Read-only diagnostic of the first asynchronous callback against the actual index.
+    let e = Engine.shared
+    e.reloadIndex()
+    e.warm()
+    for q in args[(i + 1)...] {
+        let start = Date(), deadline = Date().addingTimeInterval(15)
+        var received = false
+        e.search(q) { result in
+            guard !received else { return }
+            received = true
+            let files = result.hits.filter { $0.path != nil }
+            print("\(Int(Date().timeIntervalSince(start) * 1000)) ms | \(q) | \(files.count) files | \(files.first?.title ?? "none")")
+        }
+        while !received && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+        if !received { print("Timed out | " + q) }
+    }
+    fflush(stdout)
+    _exit(0)
+}
+if let i = args.firstIndex(of: "--query") {
+    // debugging aid: print what the bar would show
+    let e = Engine.shared
+    e.debug = true
+    e.reloadIndex()
+    if !args.contains("--lexical") { e.warm(wait: true) }
+    for q in args[(i + 1)...] where q != "--lexical" {
+        // "path|request" tests a request about an attached file
+        let parts = q.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        e.sync {
+            let t = Date()
+            let r = parts.count > 1 && FileManager.default.fileExists(atPath: parts[0]) ? e.build(parts[1], chips: [parts[0]]) : e.build(q)
+            print("\n> \(q)   (\(Int(Date().timeIntervalSince(t) * 1000)) ms)" + (r.note.isEmpty ? "" : "   [\(r.note)]"))
+            for h in r.hits { print(String(format: "  %5.2f  %-11@ %@   — %@", h.score, h.tag, h.title, h.subtitle)) }
+        }
+        // show what the language model turns a refinable row into
+        var pending: Hit?
+        e.sync { pending = (parts.count > 1 && FileManager.default.fileExists(atPath: parts[0]) ? e.build(parts[1], chips: [parts[0]]) : e.build(q)).hits.first { $0.refine != nil } }
+        if let refine = pending?.refine {
+            var done = false
+            refine { h in
+                if let h { print("     ↳ refined: \(h.title)   — \(h.subtitle)") }
+                done = true
+            }
+            while !done { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        }
+    }
+    fflush(stdout)
+    _exit(0)
+}
+
+if let i = args.firstIndex(of: "--selftest"), i + 1 < args.count {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    Engine.shared.reloadIndex()
+    Engine.shared.warm()
+    let bar = BarController()
+    Engine.shared.onChange = { bar.refresh() }
+    bar.selfTest(args[i + 1]) { lines in
+        lines.forEach { print($0) }
+        fflush(stdout)
+        _exit(0)
+    }
+    app.run()
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()
+
+#endif

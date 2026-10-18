@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>local.sembar</string>
+    <key>CFBundleName</key><string>SemBar</string>
+    <key>CFBundleExecutable</key><string>SemBar</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSAppleEventsUsageDescription</key><string>SemBar reads the Finder selection and runs the commands you pick (dark mode, Mail drafts, Notes search).</string>
+    <key>NSCalendarsFullAccessUsageDescription</key><string>SemBar finds your events by description and adds the ones you ask for.</string>
+    <key>NSRemindersFullAccessUsageDescription</key><string>SemBar adds the reminders you ask for.</string>
+    <key>NSContactsUsageDescription</key><string>SemBar finds people by name and fills in their address when you email them.</string>
+    <key>NSDesktopFolderUsageDescription</key><string>SemBar indexes your files so you can find them by description.</string>
+    <key>NSDocumentsFolderUsageDescription</key><string>SemBar indexes your files so you can find them by description.</string>
+    <key>NSDownloadsFolderUsageDescription</key><string>SemBar indexes your files so you can find them by description.</string>
+</dict>
+</plist>
