@@ -24,6 +24,7 @@ struct Hit {
     var stay = false      // keep the bar open after running
     var promote = false   // a refined row that should move to the top
     var why = ""          // how the score was made up ("name 16 · meaning 2.1 · habit 1"), shown while ⌥ is held
+    var date: Double? = nil  // modification/start time, formatted relatively by the panel
     // asks the language model for a better version of this row; nil means keep it
     var refine: ((@escaping (Hit?) -> Void) -> Void)?
     let run: (_ alt: Bool) -> Void
@@ -212,15 +213,50 @@ enum Actions {
             Sys.script("tell application \"loginwindow\" to «event aevtrlgo»")
         },
         command("reindex", "Reindex Files", "arrow.triangle.2.circlepath", ["semantic reindex", "rebuild the search index", "rescan my files"]) {
-            AppDelegate.shared?.startIndexer()
+            guard let d = AppDelegate.shared else { return }
+            if d.indexingPaused { d.setIndexingPaused(false) } else { d.startIndexer() }
         },
-command("autopaste", "Let Semantic Paste into ChatGPT", "hand.tap", ["enable automatic paste into chatgpt", "allow semantic accessibility",
+        command("autopaste", "Let Semantic Paste into ChatGPT", "hand.tap", ["enable automatic paste into chatgpt", "allow semantic accessibility",
                                                                             "attach images to chatgpt automatically"]) {
             if AXIsProcessTrusted() { Toast.show("Already allowed") } else {
                 _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
             }
         },
-                command("quit", "Quit Semantic", "xmark.circle", ["exit semantic", "close the search bar app"]) { NSApp.terminate(nil) },
+        command("quit", "Quit Semantic", "xmark.circle", ["exit semantic", "close the search bar app"]) { NSApp.terminate(nil) },
+        Intent(id: "semantic.settings", exemplars: ["semantic settings", "preferences", "settings", "change the semantic hotkey",
+                                                    "semantic preferences", "change which folders are indexed", "configure semantic"]) { _ in
+            [Hit(title: "Semantic Settings…", subtitle: "Shortcut, folders, sources, clipboard, Ask destination", icon: .symbol("gearshape"), tag: "Semantic") { _ in
+                SettingsWindow.show()
+            }]
+        },
+        Intent(id: "semantic.permissions", exemplars: ["semantic permissions", "permissions", "grant semantic access", "what can semantic access",
+                                                       "allow full disk access for semantic"]) { _ in
+            [Hit(title: "Semantic Permissions…", subtitle: "What is allowed, and where to change it", icon: .symbol("hand.raised"), tag: "Semantic") { _ in
+                PermissionsWindow.show()
+            }]
+        },
+        Intent(id: "clipboard.clear", exemplars: ["clear clipboard history", "delete my clipboard history", "forget everything i copied",
+                                                  "erase clipboard history"]) { _ in
+            [Hit(title: "Clear Clipboard History", subtitle: "Deletes the copies Semantic kept", icon: .symbol("clipboard"), tag: "Command") { _ in
+                Sys.confirm("Delete all clipboard history kept by Semantic?") { ClipboardHistory.clearAll() }
+            }]
+        },
+        Intent(id: "window", exemplars: ["switch to the safari window", "go to my figma window", "switch to chrome", "focus the terminal window",
+                                         "bring up the mail window", "show my open windows", "jump to the notes window"]) { q in
+            WindowSwitcher.hits(q)
+        },
+        Intent(id: "quitapp", exemplars: ["quit spotify", "force quit chrome", "close the safari app", "kill the frozen app", "quit slack",
+                                          "force quit xcode", "exit zoom"]) { q in
+            AppQuitter.hits(q)
+        },
+        Intent(id: "emoji", exemplars: ["emoji party", "smile emoji", "heart emoji", "thumbs up emoji", "crying laughing emoji", "fire emoji",
+                                        "emoji for celebration"]) { q in
+            AppEmoji.hits(q)
+        },
+        Intent(id: "shortcut", exemplars: ["run shortcut morning routine", "run the shortcut called resize images", "start my shortcut",
+                                           "shortcuts log water", "run shortcut"]) { q in
+            Shortcuts.hits(q)
+        },
 
         settings("Wi-Fi", "com.apple.wifi-settings-extension", "wifi", ["connect to a wireless network", "wifi"]),
         settings("Bluetooth", "com.apple.BluetoothSettings", "dot.radiowaves.left.and.right", ["pair bluetooth headphones", "bluetooth"]),
@@ -234,5 +270,27 @@ command("autopaste", "Let Semantic Paste into ChatGPT", "hand.tap", ["enable aut
         settings("Storage", "com.apple.settings.Storage", "internaldrive", ["free disk space", "how much storage is left"]),
         settings("Wallpaper", "com.apple.Wallpaper-Settings.extension", "photo", ["change desktop background"]),
         settings("Login Items", "com.apple.LoginItems-Settings.extension", "person.badge.key", ["apps that open at startup", "launch at login"]),
+        settings("Notifications", "com.apple.Notifications-Settings.extension", "bell.badge", ["turn off notifications", "notification banners"]),
+        settings("Focus", "com.apple.Focus-Settings.extension", "moon", ["do not disturb", "focus modes"]),
+        settings("Trackpad", "com.apple.Trackpad-Settings.extension", "rectangle.and.hand.point.up.left", ["tap to click", "trackpad gestures", "scroll direction"]),
+        settings("Mouse", "com.apple.Mouse-Settings.extension", "computermouse", ["mouse speed", "mouse tracking"]),
+        settings("Desktop & Dock", "com.apple.Desktop-Settings.extension", "dock.rectangle", ["hide the dock", "dock size", "hot corners", "stage manager"]),
+        settings("Control Center", "com.apple.ControlCenter-Settings.extension", "switch.2", ["menu bar icons", "show battery percentage"]),
+        settings("Appearance", "com.apple.Appearance-Settings.extension", "paintpalette", ["accent color", "scroll bar visibility"]),
+        settings("Accessibility", "com.apple.Accessibility-Settings.extension", "accessibility", ["zoom the screen", "voiceover", "reduce motion"]),
+        settings("Lock Screen", "com.apple.Lock-Screen-Settings.extension", "lock.display", ["screen saver delay", "require password after sleep"]),
+        settings("Users & Groups", "com.apple.Users-Groups-Settings.extension", "person.2", ["add a user account", "guest user"]),
+        settings("Passwords", "com.apple.Passwords-Settings.extension", "key", ["saved passwords", "password manager"]),
+        settings("Touch ID & Password", "com.apple.Touch-ID-Settings.extension", "touchid", ["add a fingerprint", "change login password"]),
+        settings("Date & Time", "com.apple.Date-Time-Settings.extension", "clock", ["change time zone", "24 hour clock"]),
+        settings("Language & Region", "com.apple.Localization-Settings.extension", "globe", ["change language", "date format", "temperature units"]),
+        settings("Time Machine", "com.apple.Time-Machine-Settings.extension", "clock.arrow.circlepath", ["back up my mac", "backup disk"]),
+        settings("Sharing", "com.apple.Sharing-Settings.extension", "person.2.wave.2", ["airdrop settings", "file sharing", "computer name"]),
+        settings("Screen Time", "com.apple.Screen-Time-Settings.extension", "hourglass", ["app limits", "downtime"]),
+        settings("Printers & Scanners", "com.apple.Print-Scanner-Settings.extension", "printer", ["add a printer", "default printer"]),
+        settings("Spotlight", "com.apple.Spotlight-Settings.extension", "magnifyingglass", ["spotlight privacy", "exclude folders from spotlight"]),
+        settings("Internet Accounts", "com.apple.Internet-Accounts-Settings.extension", "at", ["add an email account", "google account"]),
+        settings("Siri", "com.apple.Siri-Settings.extension", "mic", ["apple intelligence", "voice assistant"]),
+        settings("About This Mac", "com.apple.SystemProfiler.AboutExtension", "info.circle", ["mac serial number", "which macos version", "about my mac"]),
     ]
 }

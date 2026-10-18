@@ -21,6 +21,7 @@ struct Op {
     var done = "Done"
     var unavailableReason: String?
     var preflightInstalled = false
+    var undo: UndoSlot?                      // set by ops that change originals; filled in by `work`
 }
 
 enum FileOps {
@@ -147,9 +148,9 @@ enum FileOps {
                 }
             } else if kind(file) == .audio || kind(file) == .video {
                 let asset = AVURLAsset(url: URL(fileURLWithPath: file))
-                guard !asset.tracks.isEmpty else { throw OpError("\(name): can't read the media") }
+                guard !tracks(asset).isEmpty else { throw OpError("\(name): can't read the media") }
                 if op.id == "convert.m4a" || audioFormats[String(op.id.dropFirst(8))] != nil {
-                    guard !asset.tracks(withMediaType: .audio).isEmpty else { throw OpError("\(name): no audio track") }
+                    guard !tracks(asset, .audio).isEmpty else { throw OpError("\(name): no audio track") }
                 }
             } else if kind(file) != .image, ext(file) != "pdf", op.id.hasPrefix("convert.") {
                 let url = URL(fileURLWithPath: file)
@@ -158,6 +159,19 @@ enum FileOps {
                 }
             }
         }
+    }
+
+    private final class Box: @unchecked Sendable { var tracks: [AVAssetTrack] = [] }
+
+    // the async track loaders, waited on: preflight runs off the main thread, inside an op's work
+    static func tracks(_ asset: AVURLAsset, _ type: AVMediaType? = nil) -> [AVAssetTrack] {
+        let box = Box(), sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            if let type { box.tracks = (try? await asset.loadTracks(withMediaType: type)) ?? [] } else { box.tracks = (try? await asset.load(.tracks)) ?? [] }
+            sem.signal()
+        }
+        sem.wait()
+        return box.tracks
     }
 
     static func checked(_ op: Op, _ files: [String]) -> Op {
@@ -533,7 +547,8 @@ enum FileOps {
 
     static func renameOp(_ files: [String], _ raw: String) -> Op {
         let name = raw.trimmingCharacters(in: CharacterSet(charactersIn: " \"'“”"))
-        return checked(simple("rename", "Rename to “\(name)”", "pencil", done: "Renamed") {
+        let slot = UndoSlot()
+        var op = simple("rename", "Rename to “\(name)”", "pencil", done: "Renamed") {
             guard files.count == 1 else { throw OpError("Rename requires exactly one file; attach one file at a time") }
             guard let f = files.first, !name.isEmpty, !name.contains("/") else { throw OpError("Not a usable name") }
             let e = (f as NSString).pathExtension
@@ -541,21 +556,32 @@ enum FileOps {
             let dst = (f as NSString).deletingLastPathComponent + "/" + full
             guard !FileManager.default.fileExists(atPath: dst) else { throw OpError("“\(full)” already exists there") }
             try FileManager.default.moveItem(atPath: f, toPath: dst)
+            let entry = UndoStack.shared.begin("Rename")
+            UndoStack.shared.record(entry, from: f, to: dst)
+            slot.entry = entry
             return [dst]
-        }, files)
+        }
+        op.undo = slot
+        return checked(op, files)
     }
 
     static func relocateOp(_ files: [String], _ raw: String, copy: Bool) -> Op {
         let dir = folder(named: raw)
         let shown = dir.map(Paths.tilde) ?? "“\(raw)”"
-        return checked(simple(copy ? "copy" : "move", "\(copy ? "Copy" : "Move") to \(shown)" + plural(files), copy ? "doc.on.doc" : "folder", done: copy ? "Copied" : "Moved") {
+        let slot = UndoSlot()
+        var op = simple(copy ? "copy" : "move", "\(copy ? "Copy" : "Move") to \(shown)" + plural(files), copy ? "doc.on.doc" : "folder", done: copy ? "Copied" : "Moved") {
             guard let dir else { throw OpError("No folder named “\(raw)”") }
+            let e = copy ? nil : UndoStack.shared.begin("Move")
+            slot.entry = e
             return try batch(files) { f in
                 let dst = unique(dir + "/" + (f as NSString).lastPathComponent)
                 if copy { try FileManager.default.copyItem(atPath: f, toPath: dst) } else { try FileManager.default.moveItem(atPath: f, toPath: dst) }
+                if let e { UndoStack.shared.record(e, from: f, to: dst) }
                 return dst
             }
-        }, files)
+        }
+        if !copy { op.undo = slot }
+        return checked(op, files)
     }
 
     static func ocrOp(_ files: [String]) -> Op {
@@ -570,14 +596,21 @@ enum FileOps {
     }
 
     static func trashOp(_ files: [String]) -> Op {
-        checked(simple("trash", "Move to Trash" + plural(files), "trash", done: "Moved to Trash") {
+        let slot = UndoSlot()
+        var op = simple("trash", "Move to Trash" + plural(files), "trash", done: "Moved to Trash") {
+            let e = UndoStack.shared.begin("Move to Trash")
+            slot.entry = e
             _ = try batch(files) { f in
                 var result: NSURL?
                 try FileManager.default.trashItem(at: URL(fileURLWithPath: f), resultingItemURL: &result)
+                // Undo moves the item back out of the Trash; without its new location there is nothing to restore
+                if let to = result?.path { UndoStack.shared.record(e, from: f, to: to) }
                 return result?.path ?? f
             }
             return []
-        }, files)
+        }
+        op.undo = slot
+        return checked(op, files)
     }
 
     static func similarOp(_ file: String) -> Op {
@@ -638,7 +671,7 @@ enum FileOps {
         default: break
         }
         if files.allSatisfy({ [.image, .doc].contains(kind($0)) }) {
-            ops.append(Op(id: "ask", title: "Ask ChatGPT about this", symbol: "bubble.left.and.text.bubble.right",
+            ops.append(Op(id: "ask", title: "Ask \(Assistant.name) about this", symbol: "bubble.left.and.text.bubble.right",
                           ui: { Assistant.ask("", files: files, app: Assistant.prefersApp) }))
         }
         return (ops + common(files)).map { checked($0, files) }.filter { $0.unavailableReason == nil }
@@ -785,17 +818,21 @@ enum FileOps {
         if let ui = op.ui { ui(); return }
         guard let work = op.work else { return }
         Toast.show("Working…", sticky: true)
+        op.undo?.entry = nil
+        // an op that changed originals offers to put them back
+        func undo() -> Toast.Action? { op.undo?.entry.flatMap { $0.moves.isEmpty ? nil : UndoStack.shared.undoAction($0) } }
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let outs = try work()
                 DispatchQueue.main.async {
-                    Toast.show("✓ " + op.done + (outs.first.map { " → " + ($0 as NSString).lastPathComponent } ?? ""))
+                    let action = undo()
+                    Toast.show("✓ " + op.done + (outs.first.map { " → " + ($0 as NSString).lastPathComponent } ?? ""), seconds: action == nil ? 2.4 : 6, action: action)
                     if !outs.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(outs.map { URL(fileURLWithPath: $0) }) }
                 }
             } catch {
                 let outputs = (error as? OpError)?.completedOutputs ?? []
                 DispatchQueue.main.async {
-                    Toast.show("✗ " + error.localizedDescription, seconds: outputs.isEmpty ? 4 : 8)
+                    Toast.show("✗ " + error.localizedDescription, seconds: outputs.isEmpty ? 4 : 8, action: undo())
                     if !outputs.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(outputs.map { URL(fileURLWithPath: $0) }) }
                 }
             }

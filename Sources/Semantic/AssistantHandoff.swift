@@ -9,7 +9,7 @@ enum AssistantHandoff {
     static var controlPermissionName: String {
         ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 27 ? "Device Control and Data Access" : "Accessibility"
     }
-    private static func openPrivacySettings(_ anchor: String?) {
+    static func openPrivacySettings(_ anchor: String?) {
         let base = "x-apple.systempreferences:com.apple.preference.security"
         let target = anchor.map { base + "?" + $0 } ?? "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"
         if let url = URL(string: target), NSWorkspace.shared.open(url) { return }
@@ -137,7 +137,7 @@ enum AssistantHandoff {
     static func start(question: String, files: [String], app url: URL?) {
         guard !busy else {
             AssistantDraft.show(question: question, files: files, destination: url, reason: "Another ChatGPT draft is being prepared. Your request is kept here; retry when it finishes.",
-                retry: { edited, remaining in Assistant.ask(edited, files: remaining, app: url != nil) })
+                retry: { edited, remaining in Assistant.ask(edited, files: remaining, app: url != nil, to: .chatgpt) })
             return
         }
         busy = true
@@ -146,7 +146,7 @@ enum AssistantHandoff {
             copy(prompt, files: files)
             busy = false
             AssistantDraft.show(question: prompt, files: files, destination: url, reason: message,
-                retry: { edited, remaining in Assistant.ask(edited, files: remaining, app: url != nil) }, settings: settings)
+                retry: { edited, remaining in Assistant.ask(edited, files: remaining, app: url != nil, to: .chatgpt) }, settings: settings)
         }
         guard let url else {
             // A fresh browser page, without auto-submitting a URL query or touching another tab's draft.
@@ -212,7 +212,7 @@ enum AssistantHandoff {
                                 busy = false
                                 if attached { Toast.show("\(files.count) file\(files.count == 1 ? "" : "s") attached in ChatGPT · review and send", seconds: 5) }
                                 else { AssistantDraft.show(question: prompt, files: files, destination: url, reason: "Question ready; attachments could not be verified. Review the existing draft before retrying to avoid duplicate attachments.",
-                                    retry: { edited, remaining in Assistant.ask(edited, files: remaining, app: true) }) }
+                                    retry: { edited, remaining in Assistant.ask(edited, files: remaining, app: true, to: .chatgpt) }) }
                             }
                         }
                     }

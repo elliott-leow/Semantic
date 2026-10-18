@@ -20,15 +20,16 @@ final class AssistantDraft: NSWindowController, NSWindowDelegate, NSTableViewDat
     private let instructions = NSTextField(wrappingLabelWithString: "")
     private var files: [String]
     private let destination: URL?
+    private let dest: Dest
     private let retry: ((String, [String]) -> Void)?
     private let settings: (() -> Void)?
     private var copyFilesButton: NSButton?
     private var removeButton: NSButton?
 
     static func show(question: String, files: [String], destination: URL?, reason: String,
-                     retry: ((String, [String]) -> Void)? = nil, settings: (() -> Void)? = nil) {
+                     retry: ((String, [String]) -> Void)? = nil, settings: (() -> Void)? = nil, to dest: Dest = .chatgpt) {
         let controller = AssistantDraft(question: question, files: files, destination: destination, reason: reason,
-                                        retry: retry, settings: settings)
+                                        retry: retry, settings: settings, dest: dest)
         drafts[controller.id] = controller
         controller.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -44,13 +45,14 @@ final class AssistantDraft: NSWindowController, NSWindowDelegate, NSTableViewDat
     }
 
     private init(question: String, files: [String], destination: URL?, reason: String,
-                 retry: ((String, [String]) -> Void)?, settings: (() -> Void)?) {
+                 retry: ((String, [String]) -> Void)?, settings: (() -> Void)?, dest: Dest) {
         self.files = files
         self.destination = destination
+        self.dest = dest
         self.retry = retry
         self.settings = settings
         let window = DraftPanel(contentRect: NSRect(x: 0, y: 0, width: 740, height: 570), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        window.title = "ChatGPT draft"
+        window.title = "\(dest.name) draft"
         window.isReleasedWhenClosed = false
         window.hidesOnDeactivate = false
         super.init(window: window)
@@ -99,7 +101,7 @@ final class AssistantDraft: NSWindowController, NSWindowDelegate, NSTableViewDat
             view.addSubview(button)
             return button
         }
-        _ = button("Open ChatGPT  ⌘O", #selector(openDestination), x: 16, y: 75, key: "o")
+        _ = button("Open \(dest.name)  ⌘O", #selector(openDestination), x: 16, y: 75, key: "o")
         copyFilesButton = button("Copy files  ⌘2", #selector(copyAttachments), x: 251, y: 75, key: "2")
         _ = button("Copy question  ⌘1", #selector(copyPrompt), x: 486, y: 75, key: "1")
         let retryButton = button("Retry  ⌘R", #selector(retryHandoff), x: 16, y: 39, key: "r")
@@ -136,14 +138,14 @@ final class AssistantDraft: NSWindowController, NSWindowDelegate, NSTableViewDat
         copyFilesButton?.isEnabled = !files.isEmpty && valid
         removeButton?.isEnabled = !table.selectedRowIndexes.isEmpty
         instructions.stringValue = !valid ? "Restore missing files or access, or remove unsupported attachments below. Retry checks every remaining file before preparing a draft."
-            : files.isEmpty ? "Open a new ChatGPT chat, then copy and paste your question. Send when ready."
-            : "Open a new ChatGPT chat. Paste the files, then copy and paste your question. If files already appear, skip the file paste. Send when ready."
+            : files.isEmpty ? "Open a new \(dest.name) chat, then copy and paste your question. Send when ready."
+            : "Open a new \(dest.name) chat. Paste the files, then copy and paste your question. If files already appear, skip the file paste. Send when ready."
         table.reloadData()
     }
     @objc private func copyPrompt() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(prompt.string, forType: .string)
-        status.stringValue = "Question copied. Paste it in ChatGPT."
+        status.stringValue = "Question copied. Paste it in \(dest.name)."
     }
     @objc private func copyAttachments() {
         guard files.allSatisfy({ Assistant.attachmentIssue($0) == nil }) else {
@@ -152,7 +154,7 @@ final class AssistantDraft: NSWindowController, NSWindowDelegate, NSTableViewDat
         NSPasteboard.general.clearContents()
         NSPasteboard.general.writeObjects(files.map { URL(fileURLWithPath: $0) as NSURL })
         NSPasteboard.general.setPropertyList(files, forType: .init("NSFilenamesPboardType"))
-        status.stringValue = "Files copied. Paste them in ChatGPT."
+        status.stringValue = "Files copied. Paste them in \(dest.name)."
     }
     @objc private func removeAttachments() {
         for row in table.selectedRowIndexes.reversed() where files.indices.contains(row) { files.remove(at: row) }
@@ -168,6 +170,6 @@ final class AssistantDraft: NSWindowController, NSWindowDelegate, NSTableViewDat
     @objc private func openSettings() { settings?() }
     @objc private func openDestination() {
         if let destination { NSWorkspace.shared.openApplication(at: destination, configuration: NSWorkspace.OpenConfiguration()) }
-        else { Sys.open("https://chatgpt.com/") }
+        else { Sys.open(dest.web) }
     }
 }

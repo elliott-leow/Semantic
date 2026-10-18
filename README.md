@@ -1,6 +1,6 @@
 # Semantic
 
-A natural-language Spotlight replacement for macOS. Press **⌘Y**, describe what you want.
+A natural-language Spotlight replacement for macOS. Press **⌘Y** (configurable), describe what you want.
 
 It runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) locally through
 llama.cpp. Files, images, audio, video, apps and commands all live in one 512-d embedding space,
@@ -13,6 +13,20 @@ so "screenshot with bar receipt" matches on the pixels and the OCR text of a scr
 Builds llama.cpp (static, Metal), downloads the models (176 MB text + 555 MB vision/audio encoders)
 to `~/Library/Application Support/Semantic/models`, installs `~/Applications/Semantic.app` and launches it.
 Needs Xcode command line tools and `cmake` (or `uv`, which fetches cmake on the fly).
+
+| Option | Effect |
+| --- | --- |
+| `--no-run` | build and install, don't launch |
+| `--build-only` | build into `$BUILD` only |
+| `--test` | build and run the regression checks |
+| `BUILD=dir` | build output directory (default `./build`), so several builds can run side by side |
+| `SIGN_IDENTITY=…` | code-signing identity; default is the first valid "Apple Development" identity, else ad-hoc |
+
+A stable signing identity keeps privacy permissions (Accessibility, Screen Recording, Full Disk Access)
+across rebuilds; an ad-hoc signature changes every build and macOS drops them.
+
+On first launch Semantic shows its **Permissions** window once, adds a menu bar item, and registers itself
+as a login item (once; turning it off in System Settings or Semantic Settings sticks).
 
 ## Keys
 
@@ -30,6 +44,7 @@ Needs Xcode command line tools and `cmake` (or `uv`, which fetches cmake on the 
 | drag | drag a result or its preview to another app; drop files onto the field to attach them |
 | ⌫ | on an empty field, remove the attached file |
 | ⌘P | Quick Look |
+| ⌘Z | on an empty field, undo the last rename, move or trash from the past two minutes |
 | esc | hide |
 
 ## Acting on a file
@@ -53,7 +68,9 @@ to do with it. With nothing typed you get the actions that fit its type.
 | `email this to dan` | a draft with the file attached (never sent for you) |
 
 Conversions and image transforms preserve originals; results get a new name next to them and are revealed in Finder.
-Explicit rename, move and trash commands change the originals. Rename accepts one file at a time.
+Explicit rename, move and trash commands change the originals; their confirmation has an **Undo** button
+(also ⌘Z in the bar for two minutes). Undo moves items back, out of the Trash too, and never overwrites a file
+that has since taken the old name: it reports the conflict and can be retried once it is cleared. Rename accepts one file at a time.
 ZIP keeps nested folders and disambiguates repeated attachment names. Resize accepts 1–16,384 pixels
 per side and at most 40 million output pixels. Explicit Copy text checks every PDF page.
 Batch operations check every attachment before starting and report any completed outputs if a later runtime failure occurs.
@@ -66,16 +83,25 @@ were attached. The line under the bar always shows what was picked.
 
 | You type | What happens |
 | --- | --- |
-| `what does most recent screenshot say` | newest screenshot (read from disk, so one taken seconds ago counts) → Ask ChatGPT |
+| `what does most recent screenshot say` | newest screenshot (read from disk, so one taken seconds ago counts) → Ask |
 | `convert my latest screenshot to jpg`, `rename the screenshot i just took to receipt` | the file command runs on it |
 | `summarize my last download`, `move last 2 downloads to documents` | newest files in Downloads |
 | `latest screenshots`, `newest pdf in downloads`, `open latest screenshot` | shows them, with the actions that fit |
 | `turn the ifp syllabus into a pdf`, `summarize my resume` | the file that description matches; runners-up are listed below, ⇥ on one to use it instead |
 | `explain what's on my screen`, `what is this error` | takes a screenshot when you press Return and asks about it (needs Screen Recording) |
 | `fix the grammar of my clipboard`, `translate my clipboard to french` | clipboard text goes with the question |
-| `what's due in my algos homework` | Ask ChatGPT with the relevant file candidates listed in the action |
+| `what's due in my algos homework` | Ask with the relevant file candidates listed in the action |
 
-## Asking ChatGPT
+## Asking ChatGPT, Claude or Gemini
+
+`"assistant"` in the config (or Settings) picks where Ask goes: `"chatgpt"` (default; the app when installed),
+`"web"` (chatgpt.com), `"claude"` (the Claude app when installed, else claude.ai) or `"gemini"` (gemini.google.com).
+Starting a request with `ask claude`, `ask gemini` or `ask chatgpt` overrides it for that request. Rows say
+where they go ("Ask Claude: …").
+
+Only ChatGPT has the automated handoff described below. For Claude and Gemini, Return opens the app or site,
+puts the files (or, with no files, the question) on the clipboard, and opens the local draft window with
+**Open Claude**/**Open Gemini**, **Copy files** and **Copy question**. Nothing is submitted.
 
 The visible **Ask ChatGPT** action lists the files it will attach. When no files are attached to the
 bar, it uses the strongest file candidates from the current search, at most five. Files you explicitly
@@ -122,11 +148,19 @@ Finder copy/paste, or drag and drop.
   `videos`, `notes from september`. What was understood is shown under the bar.
 - **Inside files**: PDFs are indexed per page, audio per 30 s, video per frame; a hit says `Page 12` or
   `At 3:20` and opens there (PDF pages open in the browser, since Preview cannot be told a page).
-- **Other sources**: browser history and bookmarks (Firefox, Chrome, Brave, Edge, Arc; Safari with Full
-  Disk Access), calendar events, contacts, Apple Notes (read only while Notes is open), clipboard history
-  (last 200 text clips; entries marked secret by password managers are skipped).
+- **Other sources**: browser history and bookmarks (every profile of Chrome, Brave, Edge, Arc, Vivaldi, Opera
+  and Dia; Firefox, Zen, Orion; Safari with Full Disk Access), calendar events, contacts, Apple Notes (read only
+  while Notes is open), clipboard history (last 200 text clips, dropped after `clipboardDays`; entries marked
+  secret by password managers, and anything copied while a password manager or Keychain Access is in front,
+  are skipped; images are not kept).
 - **Find Similar**: image/video and audio matches must pass a similarity threshold before the five-file
   cap. The thresholds were checked with synthetic drawings and speech, not a broad real-world benchmark.
+- **More commands**: `switch to the figma window` (open windows; titles need Screen Recording, raising a
+  particular window needs Accessibility, otherwise the app is activated), `quit spotify` / `force quit chrome`
+  (running apps; ⌘↩ force-quits, after a confirmation), `party emoji` / `thumbs up emoji` (a built-in table
+  of about 500; Return copies), `run shortcut morning routine` (Shortcuts, via `shortcuts run`), about 35 System
+  Settings panes (`trackpad settings`, `do not disturb`, `hot corners`), `clear clipboard history`,
+  `settings` and `permissions` (Semantic's own windows).
 - **Apps first**: a word of an app's name (`chrome`, `spot`, `s`) ranks the app above files with similar names.
 - **Learning**: what you pick for a query leads that query next time, and its first letters too (one letter of
   `spot` predicts Spotify). A choice repeated for the same words makes them mean that thing, even without a
@@ -169,8 +203,14 @@ Anything that can be computed is answered in the first row; Return copies it (`a
   while you are using it; it is freed after 5 minutes hidden. Queries combine filename/path matching and SQLite full-text search with a
   local embedding and a scan of an int8 matrix.
 - **Indexer** (`Semantic --index`): a short-lived child process. It is the only thing that ever loads the
-  vision and audio encoders, and it exits when done. It runs at launch, hourly, and when files change;
-  if nothing changed it exits without loading a model.
+  vision and audio encoders, and it exits when done. It walks everything at launch and hourly; file changes
+  start an incremental run over just the changed folders (`--index --paths`, debounced at least 5 s, at most
+  once a minute). If nothing changed it exits without loading a model. Failing files are retried with backoff
+  and given up after 3 attempts. With `reduceIndexingOnBattery`, image/audio/video work waits while on battery,
+  in Low Power Mode or when the Mac is hot. The menu bar item pauses, resumes and rebuilds it.
+- **Extraction**: PDF, Word, PowerPoint (every slide and its notes), Keynote/Pages/Numbers (through their
+  QuickLook preview), EPUB, RTF and plain text; long documents are split into passages. The first 10 minutes
+  of audio and video are transcribed on-device, only when Speech Recognition is allowed.
 - **Signals per file**: name + extracted text (PDF, Office, plain text), the image itself, OCR of the
   image, 30 s of audio, one video frame. Scores are z-normalised per signal, then combined with a
   lexical filename match.
@@ -178,23 +218,64 @@ Anything that can be computed is answered in the first row; Return copies it (`a
   nearest one. Actions check what is installed before choosing a handler (Spotify vs Apple Music vs
   browser, Dictionary vs web, and so on).
 
+## Menu bar, Settings and Permissions
+
+The menu bar item has Show Semantic (with the current shortcut), the indexing status (read only while the
+menu is open), Pause/Resume Indexing, Rebuild Index (`--index --full`), Settings…, Permissions…, Open Config
+File and Quit. `"menuBar": false` hides it; the bar's `settings` command still opens everything.
+
+**Settings** writes `config.json` directly, keeping keys it does not show: the shortcut (click and type a new
+one; a shortcut another app holds is refused with a message and the old one kept), menu bar item, open at
+login, indexed folders, excluded folders and patterns, sources, clipboard history (on/off, how long, clear),
+the Ask destination and how long the text model stays loaded.
+
+**Permissions** lists Full Disk Access, Accessibility, Screen Recording, Calendar, Reminders, Contacts,
+Automation (Finder) and Speech Recognition, whether each is allowed, what it enables, and a button that asks
+for it or opens the right System Settings pane. Nothing requires any of them.
+
 ## Config
 
-Optional `~/.config/semantic/config.json`:
+Optional `~/.config/semantic/config.json` (all keys optional):
 
     {
       "roots": ["~/Documents", "~/Screenshots"],
+      "excludes": ["~/Documents/Private", "*.secret"],
       "maps": "browser",
       "searchURL": "https://duckduckgo.com/?q=%s",
       "unloadAfter": 300,
+      "hotkey": "cmd+y",
+      "menuBar": true,
       "clipboard": true,
+      "clipboardDays": 30,
+      "clipboardIgnoreApps": ["com.1password.1password", "com.bitwarden.desktop"],
       "finderSelection": true,
       "sources": ["web", "calendar", "contacts", "notes"],
-      "assistant": "app"
+      "assistant": "chatgpt",
+      "reduceIndexingOnBattery": true
     }
 
-`roots` defaults to visible folders in your home directory, excluding caches, dependencies and build
-outputs. Repository filenames are indexed; expensive content extraction remains selective. `maps` is `browser` or `apple`.
+| Key | Meaning |
+| --- | --- |
+| `roots` | folders to index; default: visible folders in your home directory, excluding caches, dependencies and build outputs |
+| `excludes` | folders (`~` allowed) or glob patterns never indexed. A `.semanticignore` file (one glob per line) excludes within its folder |
+| `hotkey` | modifiers `cmd`, `shift`, `alt`/`opt`, `ctrl` plus a key: `alt+space`, `cmd+shift+space`, `ctrl+opt+k`, `f13` (F-keys need no modifier). Default `cmd+y` |
+| `menuBar` | `false` hides the menu bar item |
+| `clipboardDays` | clipboard rows older than this are deleted (default 30; `0` keeps them until the 200-row cap) |
+| `clipboardIgnoreApps` | bundle ids whose copies are never kept; default 1Password, Bitwarden, Keychain Access and Passwords |
+| `assistant` | `chatgpt` (default; `app` is the older spelling), `web`, `claude`, `gemini` |
+| `reduceIndexingOnBattery` | defer image/audio/video work on battery, Low Power Mode or when hot (default true) |
+| `maps` | `browser` or `apple` |
+| `unloadAfter` | seconds hidden before the text model is freed (default 300) |
+
+Repository filenames are indexed; expensive content extraction remains selective.
+
+## Privacy
+
+Everything runs on this Mac: the index, the models, the habit data and clipboard history live in
+`~/Library/Application Support/Semantic`. The only network request Semantic makes itself is the daily
+currency-rate fetch for the calculator. Questions and files go to ChatGPT, Claude or Gemini only when you
+choose an Ask row, and nothing is ever sent for you: you review and send the draft. Web, maps and YouTube rows
+open your browser only when chosen.
 
 ## Debugging
 
@@ -205,6 +286,9 @@ outputs. Repository filenames are indexed; expensive content extraction remains 
     Semantic --llm "remind me to call mum at 5"        # raw command-model output
     Semantic --similar /path/photo.jpg                 # query by example
     Semantic --index --full                            # rebuild the index from scratch
+    Semantic --eval [--verbose]                        # replay past picks: how highly the current ranking puts them
+    Semantic --suggest                                 # what the empty bar would offer now
+    Semantic --calc "15% of 80"                        # calculator only
 
 ## Development checks
 

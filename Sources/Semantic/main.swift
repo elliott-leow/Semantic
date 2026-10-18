@@ -3,6 +3,7 @@ import Carbon.HIToolbox
 import Contacts
 import EventKit
 import ServiceManagement
+import Speech
 import SQLite3
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -15,7 +16,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pendingIndex = false
     var progressTimer: Timer?
     private var unloadTimer: Timer?
-    private var hotKey: EventHotKeyRef?
+    var hotKey: EventHotKeyRef?
+    var activeHotkey: Hotkey?
+    var hotKeyHandlerInstalled = false
+    var menuBar: MenuBar?
+    // set from the menu bar; startIndexer (IndexScheduler.swift) must not launch while true
+    var indexingPaused = false
     var stream: FSEventStreamRef?
     var ticks = 0
     private var frontApp: (path: String, since: Date)?
@@ -31,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         bar = BarController()
+        bar.loadMore = { q, chips, done in Engine.shared.moreFiles(q, chips: chips, done: done) }
         bar.onHide = { [weak self] in self?.scheduleUnload() }
         Engine.shared.onChange = { [weak self] in
             guard let self, self.bar.isVisible else { return }
@@ -38,17 +45,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         Rates.onUpdate = { Engine.shared.onChange?() }
         Engine.shared.reloadIndex()
-        registerHotKey()
+        // a configured shortcut that cannot be had falls back to ⌘Y rather than leaving no way in
+        if !registerHotKey(), Hotkey.configured != .fallback { registerHotKey(.fallback) }
+        MenuBar.apply()
         watchFiles()
         startIndexer()
-        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in self?.startIndexer() }
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            guard let self, !self.indexingPaused else { return }
+            self.startIndexer()
+        }
         watchClipboard()
         watchApps()
         askForSources()
+        DispatchQueue.global(qos: .utility).async { _ = Shortcuts.names() }
+        if Bundle.main.bundlePath.hasSuffix(".app"), !UserDefaults.standard.bool(forKey: "shownPermissions") {
+            UserDefaults.standard.set(true, forKey: "shownPermissions")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { PermissionsWindow.show() }
+        }
 
         if !FileManager.default.fileExists(atPath: Paths.model) { bar.status = "Model not found — run ./build.sh to download it" }
 
-        // once only, so turning it off in System Settings sticks
+        // once only, so turning it off in System Settings sticks. The key lives in the local.semantic
+        // defaults domain, so the renamed app registers itself once; the old SemBar item is left alone.
         if Bundle.main.bundlePath.hasSuffix(".app"), !UserDefaults.standard.bool(forKey: "loginItemRegistered") {
             UserDefaults.standard.set(true, forKey: "loginItemRegistered")
             try? SMAppService.mainApp.register()
@@ -78,8 +96,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func askForSources() {
         guard Bundle.main.bundlePath.hasSuffix(".app"), !UserDefaults.standard.bool(forKey: "askedSources") else { return }
         UserDefaults.standard.set(true, forKey: "askedSources")
-        let again = { DispatchQueue.main.async { self.pendingIndex = true; self.startIndexer() } }
-        let contacts = { if Sources.enabled("contacts") { CNContactStore().requestAccess(for: .contacts) { _, _ in again() } } }
+        let again = { DispatchQueue.main.async { self.pendingIndex = true; if !self.indexingPaused { self.startIndexer() } } }
+        // the indexer transcribes audio only once this is granted; it never asks itself
+        let speech = { SFSpeechRecognizer.requestAuthorization { _ in again() } }
+        let contacts = { if Sources.enabled("contacts") { CNContactStore().requestAccess(for: .contacts) { _, _ in speech() } } else { speech() } }
         if Sources.enabled("calendar") { Commands.store.requestFullAccessToEvents { _, _ in contacts() } } else { contacts() }
     }
 
@@ -98,34 +118,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // always polled, so turning history on in Settings works without a relaunch
     private func watchClipboard() {
-        guard config.clipboard != false else { return }
         let t = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.pollClipboard() }
         t.tolerance = 0.5
+        // rows past `clipboardDays` age out even when nothing new is copied
+        let prune = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in ioQueue.async { Store().map { ClipboardHistory.prune($0) } } }
+        prune.tolerance = 300
+        prune.fire()
     }
 
     private func pollClipboard() {
         let pb = NSPasteboard.general
         guard pb.changeCount != clipCount else { return }
         clipCount = pb.changeCount
+        guard config.clipboard != false, !ClipboardHistory.ignored(NSWorkspace.shared.frontmostApplication?.bundleIdentifier) else { return }
         // password managers mark secrets with these types; never keep those
         let secret = ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "org.nspasteboard.AutoGeneratedType", "com.agilebits.onepassword"]
         if (pb.types ?? []).contains(where: { secret.contains($0.rawValue) }) { return }
         guard let s = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), s.count >= 3, s.count <= 20000 else { return }
-        var h: UInt64 = 5381
-        for b in s.utf8 { h = h &* 33 &+ UInt64(b) }
-        let key = "clip:\(h)", now = Date().timeIntervalSince1970
-        let name = String((s.split(separator: "\n").first ?? "").prefix(80))
-        ioQueue.async {
-            guard let store = Store() else { return }
-            var old: [Int64] = []
-            store.run("SELECT id FROM files WHERE path = ?", [key]) { old.append(sqlite3_column_int64($0, 0)) }
-            store.run("SELECT id FROM files WHERE kind = ? ORDER BY mtime DESC LIMIT -1 OFFSET 199", [Kind.clip.rawValue]) { old.append(sqlite3_column_int64($0, 0)) }
-            for id in old { store.deleteFile(id) }
-            // state 2: the bar embeds it the next time the text model is loaded
-            store.run("INSERT INTO files(path,name,kind,mtime,size,state,snippet) VALUES(?,?,?,?,?,2,?)",
-                      [key, name, Kind.clip.rawValue, now, s.count, s])
-        }
+        ioQueue.async { Store().map { ClipboardHistory.add(s, store: $0) } }
     }
 
     // the text model is only resident while the bar is in use
@@ -134,16 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         unloadTimer = Timer.scheduledTimer(withTimeInterval: config.unloadAfter ?? 300, repeats: false) { _ in Engine.shared.unload() }
     }
 
-    private func registerHotKey() {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async { AppDelegate.shared?.toggle() }
-            return noErr
-        }, 1, &spec, nil, nil)
-        let id = EventHotKeyID(signature: OSType(0x53454D42), id: 1) // 'SEMB'
-        let rc = RegisterEventHotKey(UInt32(kVK_ANSI_Y), UInt32(cmdKey), id, GetApplicationEventTarget(), 0, &hotKey)
-        if rc != noErr { log("could not register cmd+Y (\(rc))") }
-    }
+    // registerHotKey(_:announce:) is in AppHotkey.swift
 }
 
 #if SEARCH_TESTS

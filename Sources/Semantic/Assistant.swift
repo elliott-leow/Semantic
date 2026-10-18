@@ -1,11 +1,51 @@
 import AppKit
 import ApplicationServices
 
-// Prepares a new ChatGPT draft with actual files. The user sends the message.
-enum Assistant {
-    static let appIDs = ["com.openai.chat", "com.openai.codex"]
+// Where Ask goes. ChatGPT gets the automated handoff; the others get the local draft window.
+enum Dest: String, CaseIterable {
+    case chatgpt, claude, gemini
 
-    static var appURL: URL? { appIDs.lazy.compactMap { Sys.app($0) }.first }
+    var name: String { ["chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini"][rawValue]! }
+    var appIDs: [String] {
+        switch self {
+        case .chatgpt: return ["com.openai.chat", "com.openai.codex"]
+        case .claude: return ["com.anthropic.claudefordesktop"]
+        case .gemini: return []
+        }
+    }
+    var web: String {
+        switch self {
+        case .chatgpt: return "https://chatgpt.com/"
+        case .claude: return "https://claude.ai/new"
+        case .gemini: return "https://gemini.google.com/app"
+        }
+    }
+    var site: String { URL(string: web)?.host ?? web }
+    var appURL: URL? { appIDs.lazy.compactMap { Sys.app($0) }.first }
+
+    // `"assistant"`: "chatgpt" (and the older "app"), "web" (ChatGPT's website), "claude", "gemini"
+    static var configured: Dest { Dest(rawValue: config.assistant ?? "") ?? .chatgpt }
+
+    // "ask claude …" goes to Claude whatever the setting
+    static func named(in text: String) -> Dest? {
+        let t = text.lowercased()
+        if Calc.rx(t, "^(ask )?(chat ?gpt|gpt)\\b.*") != nil { return .chatgpt }
+        if Calc.rx(t, "^(ask )?claude\\b.*") != nil { return .claude }
+        if Calc.rx(t, "^(ask )?gemini\\b.*") != nil { return .gemini }
+        return nil
+    }
+}
+
+// Prepares a new draft with actual files. The user sends the message.
+enum Assistant {
+    static var appIDs: [String] { Dest.configured.appIDs }
+    static var dest: Dest { Dest.configured }
+    static var name: String { dest.name }
+    static var tags: Set<String> { Set(Dest.allCases.map(\.name)) }
+    // Ask rows are tagged with the destination name; Search.swift can use this instead of comparing to "ChatGPT"
+    static func isAsk(_ h: Hit) -> Bool { tags.contains(h.tag) }
+
+    static var appURL: URL? { dest.appURL }
     static var prefersApp: Bool { config.assistant != "web" && appURL != nil }
 
     static func looksLikeQuestion(_ text: String) -> Bool {
@@ -25,7 +65,7 @@ enum Assistant {
     }
 
     static func clean(_ text: String) -> String {
-        text.replacingOccurrences(of: "^(ask )?(chat ?gpt|gpt)[,:]?\\s*(to |about )?", with: "", options: [.regularExpression, .caseInsensitive])
+        text.replacingOccurrences(of: "^(ask )?(chat ?gpt|gpt|claude|gemini)[,:]?\\s*(to |about )?", with: "", options: [.regularExpression, .caseInsensitive])
             .trimmingCharacters(in: .whitespaces)
     }
 
@@ -36,15 +76,17 @@ enum Assistant {
     static func hit(_ text: String, files: [String]) -> Hit {
         let files = requestedFiles(files)
         let q = clean(text)
-        let app = prefersApp
-        let place = app ? "ChatGPT app" : "chatgpt.com"
-        let other = appURL == nil ? "" : " · ⌘↩ for the \(prefersApp ? "website" : "app")"
+        let d = Dest.named(in: text) ?? dest
+        let app = d == dest ? prefersApp : d.appURL != nil
+        let place = app ? "\(d.name) app" : d.site
+        let other = d.appURL == nil ? "" : " · ⌘↩ for the \(app ? "website" : "app")"
         let what = files.isEmpty ? "" : (files.count == 1 ? (files[0] as NSString).lastPathComponent : "\(files.count) files") + " · "
-        let title = q.isEmpty ? "Ask ChatGPT about this" : "Ask ChatGPT: “\(q)”"
-        let how = files.isEmpty ? "" : " · attach on Return"
+        let title = q.isEmpty ? "Ask \(d.name) about this" : "Ask \(d.name): “\(q)”"
+        // only ChatGPT's app is automated; elsewhere Return opens a draft window to paste from
+        let how = files.isEmpty ? "" : (d == .chatgpt ? " · attach on Return" : " · copies files on Return")
         let icon: Icon = files.first.map { .file($0) } ?? .symbol("bubble.left.and.text.bubble.right")
-        return Hit(title: title, subtitle: what + place + how + other, icon: icon, tag: "ChatGPT", key: "intent:ask", selectionID: selectionID("ask", [q, app ? "app" : "web"] + files), excerpt: files.map { ($0 as NSString).lastPathComponent }.joined(separator: " · ")) { alt in
-            ask(q, files: files, app: app != alt)
+        return Hit(title: title, subtitle: what + place + how + other, icon: icon, tag: d.name, key: "intent:ask", selectionID: selectionID("ask", [q, app ? "app" : "web", d.rawValue] + files), excerpt: files.map { ($0 as NSString).lastPathComponent }.joined(separator: " · ")) { alt in
+            ask(q, files: files, app: app != alt, to: d)
         }
     }
 
@@ -65,7 +107,7 @@ enum Assistant {
         guard files.allSatisfy({ attachmentIssue($0) == nil }) else {
             AssistantDraft.show(question: question, files: requestedFiles(files), destination: prefersApp ? appURL : nil,
                 reason: "Some files cannot be read. Restore access or remove them before retrying text extraction.",
-                retry: { edited, remaining in sendText(edited, files: remaining) })
+                retry: { edited, remaining in sendText(edited, files: remaining) }, to: dest)
             return
         }
         Toast.show("Reading text…", sticky: true)
@@ -76,7 +118,7 @@ enum Assistant {
                 guard !text.isEmpty else {
                     AssistantDraft.show(question: question, files: requestedFiles(files), destination: prefersApp ? appURL : nil,
                         reason: "No readable text found. Your original question and files are kept here.",
-                        retry: { edited, remaining in sendText(edited, files: remaining) })
+                        retry: { edited, remaining in sendText(edited, files: remaining) }, to: dest)
                     return
                 }
                 ask("\(question.isEmpty ? "Explain this." : question)\n\nExtracted text:\n\(text.prefix(12000))", files: [], app: prefersApp)
@@ -89,7 +131,7 @@ enum Assistant {
         let q = clean(text)
         let name = files.count == 1 ? (files[0] as NSString).lastPathComponent : "\(files.count) files"
         return Hit(title: "Use extracted text instead", subtitle: "Text excerpt from \(name) · up to 4,000 characters per file",
-                   icon: .file(files[0]), tag: "ChatGPT", key: "intent:asktext", selectionID: selectionID("asktext", [q] + files)) { _ in sendText(q, files: files) }
+                   icon: .file(files[0]), tag: Self.name, key: "intent:asktext", selectionID: selectionID("asktext", [q] + files)) { _ in sendText(q, files: files) }
     }
 
     static func rows(_ text: String, files: [String]) -> [Hit] {
@@ -121,8 +163,8 @@ enum Assistant {
 
     // "what's on my screen", "explain this error": capture the screen once the bar is out of the way
     static func screenHit(_ question: String) -> Hit {
-        Hit(title: "Ask ChatGPT: “\(question)”", subtitle: "Captures your screen when invoked · prepares a ChatGPT draft", icon: .symbol("rectangle.dashed.badge.record"),
-            tag: "ChatGPT", key: "intent:askscreen") { _ in
+        Hit(title: "Ask \(name): “\(question)”", subtitle: "Captures your screen when invoked · prepares a \(name) draft", icon: .symbol("rectangle.dashed.badge.record"),
+            tag: name, key: "intent:askscreen") { _ in
             captureScreen(question)
         }
     }
@@ -130,7 +172,7 @@ enum Assistant {
     private static func captureScreen(_ question: String) {
         func recover(_ reason: String) {
             AssistantDraft.show(question: question, files: [], destination: prefersApp ? appURL : nil, reason: reason,
-                retry: { edited, _ in captureScreen(edited) }, settings: { AssistantHandoff.openScreenSettings() })
+                retry: { edited, _ in captureScreen(edited) }, settings: { AssistantHandoff.openScreenSettings() }, to: dest)
         }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
@@ -140,7 +182,7 @@ enum Assistant {
         let path = Paths.tmp + "/Screen \(UUID().uuidString).png"
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             do {
-                try AssistantDraft.withHiddenWindows { try FileOps.sh("/usr/sbin/screencapture", ["-x", "-m", path]) }
+                _ = try AssistantDraft.withHiddenWindows { try FileOps.sh("/usr/sbin/screencapture", ["-x", "-m", path]) }
                 guard attachmentIssue(path) == nil else { recover("Screen capture did not produce a readable image. Retry capture."); return }
                 best(question, files: [path])
             } catch {
@@ -150,27 +192,45 @@ enum Assistant {
     }
 
     static func clipHit(_ question: String, _ clip: String) -> Hit {
-        Hit(title: "Ask ChatGPT: “\(question)”", subtitle: "Clipboard · \(clip.count) characters · prepares a draft", icon: .symbol("doc.on.clipboard"),
-            tag: "ChatGPT", key: "intent:askclip", selectionID: selectionID("askclip", [question, clip])) { _ in
+        Hit(title: "Ask \(name): “\(question)”", subtitle: "Clipboard · \(clip.count) characters · prepares a draft", icon: .symbol("doc.on.clipboard"),
+            tag: name, key: "intent:askclip", selectionID: selectionID("askclip", [question, clip])) { _ in
             ask("\(question)\n\n\(clip)", files: [], app: prefersApp)
         }
     }
 
-    static func ask(_ question: String, files: [String], app wantApp: Bool) {
+    static func ask(_ question: String, files: [String], app wantApp: Bool, to d: Dest = Assistant.dest) {
         let requested = requestedFiles(files)
+        let appURL = wantApp ? d.appURL : nil
         guard requested.allSatisfy({ attachmentIssue($0) == nil }) else {
-            AssistantDraft.show(question: question, files: requested, destination: wantApp ? appURL : nil,
-                reason: "Some attachments need attention. Restore access or remove the affected files, then retry. No files were handed off.",
-                retry: { edited, remaining in ask(edited, files: remaining, app: wantApp) })
+            AssistantDraft.show(question: question, files: requested, destination: appURL, reason: "Some attachments need attention. Restore access or remove the affected files, then retry. No files were handed off.",
+                retry: { edited, remaining in ask(edited, files: remaining, app: wantApp, to: d) }, to: d)
             return
         }
-        AssistantHandoff.start(question: question, files: requested, app: wantApp ? appURL : nil)
+        guard d == .chatgpt else { return manual(question, files: requested, app: appURL, to: d) }
+        AssistantHandoff.start(question: question, files: requested, app: appURL)
+    }
+
+    // No automation for Claude or Gemini: open it, put the files (or the question) on the clipboard,
+    // and keep everything in a draft window to paste from. Nothing is submitted.
+    static func manual(_ question: String, files: [String], app: URL?, to d: Dest) {
+        let prompt = question.isEmpty ? "Explain the attached files." : question
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if files.isEmpty { pb.setString(prompt, forType: .string) } else {
+            pb.writeObjects(files.map { URL(fileURLWithPath: $0) as NSURL })
+            pb.setPropertyList(files, forType: .init("NSFilenamesPboardType"))
+        }
+        if let app { NSWorkspace.shared.openApplication(at: app, configuration: NSWorkspace.OpenConfiguration()) } else { Sys.open(d.web) }
+        let copied = files.isEmpty ? "Your question is on the clipboard" : "\(files.count) file\(files.count == 1 ? " is" : "s are") on the clipboard"
+        AssistantDraft.show(question: prompt, files: files, destination: app, reason: "\(d.name) opened. \(copied); paste it into a new chat, then send when ready.",
+            retry: { edited, remaining in ask(edited, files: remaining, app: app != nil, to: d) }, to: d)
     }
 
     static let intent = Intent(id: "ask", exemplars: [
         "explain how transformers work in simple terms", "write a python script that renames files by date", "help me draft an email declining a job offer",
         "solve x^2 + 3x + 2 = 0 step by step", "compare react and vue for a small project", "why does my c program segfault when i free twice",
         "summarize the causes of the first world war", "give me a four day workout plan", "answer this", "ask chatgpt what a monad is",
+        "ask claude to review this paragraph", "ask gemini about the history of rome",
         "what are the tradeoffs between sql and nosql databases", "prove that the square root of 2 is irrational",
         "rewrite this paragraph to sound more formal", "brainstorm names for a podcast about soundscapes",
         "walk me through the mechanism of an sn2 reaction", "what should i consider when choosing a graduate program",

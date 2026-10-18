@@ -48,6 +48,10 @@ struct Config: Codable {
     var clipboardDays: Double? // clipboard rows older than this are dropped (default 30)
     var clipboardIgnoreApps: [String]? // bundle identifiers whose copies are never kept
     var reduceIndexingOnBattery: Bool? // defer image/audio/video work on battery or when hot (default true)
+    var menuBar: Bool?         // show the menu bar item (default true)
+
+    static let defaultIgnoreApps = ["com.agilebits.onepassword7", "com.1password.1password", "com.bitwarden.desktop",
+                                    "com.apple.keychainaccess", "com.apple.Passwords"]
 }
 
 enum Paths {
@@ -85,11 +89,34 @@ enum Paths {
     }
 }
 
-let config: Config = {
-    guard let d = FileManager.default.contents(atPath: Paths.config),
+func loadConfig(_ path: String = Paths.config) -> Config {
+    guard let d = FileManager.default.contents(atPath: path),
           let c = try? JSONDecoder().decode(Config.self, from: d) else { return Config() }
     return c
-}()
+}
+
+// a var so the settings window can change it; readers just see the new value next time
+var config = loadConfig()
+func reloadConfig() { config = loadConfig() }
+
+// Writes keys into config.json without dropping keys this version does not know. nil removes a key.
+@discardableResult
+func updateConfig(_ changes: [String: Any?], path: String = Paths.config) -> Bool {
+    var dict: [String: Any] = [:]
+    if let d = FileManager.default.contents(atPath: path) {
+        // a file that is not valid JSON is the user's to fix; never overwrite it
+        guard let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { log("config.json is not valid JSON; not saving"); return false }
+        dict = j
+    }
+    for (k, v) in changes { dict[k] = v }
+    guard let out = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else { return false }
+    do {
+        try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try out.write(to: URL(fileURLWithPath: path), options: .atomic)
+    } catch { log("could not write config: \(error.localizedDescription)"); return false }
+    if path == Paths.config { reloadConfig() }
+    return true
+}
 
 // database writes that must never hold up typing
 let ioQueue = DispatchQueue(label: "semantic.io", qos: .utility)
