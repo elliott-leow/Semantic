@@ -10,6 +10,10 @@ enum RowIcons {
     private static var missing = Set<String>()
     private static var loading = Set<String>()
     private static let queue = DispatchQueue(label: "semantic.rowicons", qos: .utility)
+    // per bar session (cleared on hide), so a newly installed app or changed default browser shows next time
+    private static var browser: URL??
+    private static var appURLs: [String: URL] = [:]
+    private static let fileIcons = NSCache<NSString, NSImage>()
 
     // the app that obviously handles an action row
     private static let apps: [String: String] = [
@@ -29,7 +33,8 @@ enum RowIcons {
         if hit.tag == "Web page", let host = URL(string: key)?.host { return lazy("f|" + host, loaded) { favicon(host) } }
         if hit.tag == "Event", key == "intent:event" { return appIcon("com.apple.iCal") }
         if hit.tag == "Web" || hit.tag == "URL" {
-            guard let u = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!) else { return nil }
+            if browser == nil { browser = .some(NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!)) }
+            guard let u = browser! else { return nil }
             return fileIcon(u.path)
         }
         if let id = apps[hit.tag] { return appIcon(id) }
@@ -38,8 +43,23 @@ enum RowIcons {
 
     private static func appIcon(_ bundleID: String) -> NSImage? {
         if missing.contains(bundleID) { return nil }
-        guard let u = Sys.app(bundleID) else { missing.insert(bundleID); return nil }
+        guard let u = appURLs[bundleID] ?? Sys.app(bundleID) else { missing.insert(bundleID); return nil }
+        appURLs[bundleID] = u
         return fileIcon(u.path)
+    }
+
+    // NSWorkspace's icon for a file, kept for the session; shared, so callers never mutate it
+    static func icon(forFile path: String) -> NSImage {
+        if let i = fileIcons.object(forKey: path as NSString) { return i }
+        let i = NSWorkspace.shared.icon(forFile: path)
+        fileIcons.setObject(i, forKey: path as NSString)
+        return i
+    }
+
+    static func forget() {
+        browser = nil
+        appURLs.removeAll()
+        fileIcons.removeAllObjects()
     }
 
     private static func fileIcon(_ path: String) -> NSImage {

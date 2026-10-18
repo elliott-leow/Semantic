@@ -225,7 +225,7 @@ final class FilePreview: NSView, NSDraggingSource {
         isHidden = false
         name.stringValue = next.title
         needsLayout = true
-        fileIcon.image = NSWorkspace.shared.icon(forFile: path)
+        fileIcon.image = RowIcons.icon(forFile: path)
         detail.stringValue = RelativeDate.rewrite(next.subtitle, path: path, date: next.date)
         detail.toolTip = path
         passage.attributedStringValue = Marked.attributed(next.excerpt, font: .systemFont(ofSize: 12), color: .secondaryLabelColor,
@@ -241,7 +241,7 @@ final class FilePreview: NSView, NSDraggingSource {
         meta.stringValue = ""
         // The file's own large icon is always an honest preview. "Loading" only appears if a render is slow,
         // and a file that cannot be rendered keeps its icon rather than an error.
-        picture.image = NSWorkspace.shared.icon(forFile: path)
+        picture.image = RowIcons.icon(forFile: path)
         previewStatus.stringValue = ""
         let url = URL(fileURLWithPath: path), ext = url.pathExtension.lowercased()
         var isDir: ObjCBool = false
