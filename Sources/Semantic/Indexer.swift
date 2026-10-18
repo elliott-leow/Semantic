@@ -20,7 +20,7 @@ enum Indexer {
         var semantic = true
         var sourceRevision: String {
             guard let body else { return "" }
-            return SHA256.hash(data: Data((name + "\0" + body).utf8)).map { String(format: "%02x", $0) }.joined()
+            return Extract.hex(SHA256.hash(data: Data((name + "\0" + body).utf8)))
         }
     }
 
@@ -204,7 +204,8 @@ enum Indexer {
 
     static func storedPassages(_ store: Store, id: Int64) -> [Extract.Passage] {
         var out: [Extract.Passage] = []
-        store.run("SELECT body, src, loc FROM content WHERE file_id=?", [id]) { st in
+        // body, src, loc straight from the FTS content shadow table, in rowid order as a scan of `content` returns them
+        store.run("SELECT c1, c2, c3 FROM content_content WHERE c0=? ORDER BY id", [id]) { st in
             out.append(Extract.Passage(text: colText(st, 0), src: Src(rawValue: Int(sqlite3_column_int(st, 1))) ?? .text, loc: sqlite3_column_double(st, 2)))
         }
         return out
@@ -236,14 +237,17 @@ enum Indexer {
         return true
     }
 
-    // Extraction failure preserves the previous searchable text and its pending flag.
+    // Extraction failure preserves the previous searchable text and its pending flag. `hash` is the
+    // version whose text is now stored; a later touch with the same bytes keeps it.
     @discardableResult
-    static func persistContentExtraction(_ store: Store, id: Int64, passages: [Extract.Passage]?) -> Bool {
+    static func persistContentExtraction(_ store: Store, id: Int64, passages: [Extract.Passage]?, hash: (() -> String)? = nil) -> Bool {
         guard let passages else { return false }
+        let hash = hash?()
         store.exec("BEGIN")
-        store.run("DELETE FROM content WHERE file_id=?", [id])
+        store.deleteContent(id)
         for part in passages { store.addContent(id, part.text, src: part.src, loc: part.loc) }
         store.run("UPDATE files SET textIndexed=1 WHERE id=?", [id])
+        if let hash { store.run("UPDATE files SET contentHash=? WHERE id=?", [hash, id]) }
         store.exec("COMMIT")
         return true
     }
@@ -336,6 +340,18 @@ enum Indexer {
             (signature != previous && now - last >= 300)
     }
 
+    // p.hasPrefix(d + "/") for some d in `dirs`; many dirs are looked up by p's ancestors instead
+    static func inside(_ p: String, _ dirs: Set<String>) -> Bool {
+        if dirs.count < 8 { return dirs.contains { p.hasPrefix($0 + "/") } }
+        var i = p.utf8.startIndex
+        while let j = p.utf8[i...].firstIndex(of: UInt8(ascii: "/")) {
+            let d = String(p[..<j])
+            if dirs.contains(d), p.hasPrefix(d + "/") { return true }
+            i = p.utf8.index(after: j)
+        }
+        return false
+    }
+
     // --paths <file>: folders whose entries changed, one per line, written by the bar's file watcher
     static func argPaths() -> [String]? {
         let a = CommandLine.arguments
@@ -353,6 +369,8 @@ enum Indexer {
         migrate(store)
         let progress = IndexProgress(store)
         defer { progress.clear() }
+        var wrote = false
+        defer { if wrote { store.bumpGeneration() } }
         let multimodal = FileManager.default.fileExists(atPath: Paths.mmproj)
         let now = Date().timeIntervalSince1970
 
@@ -361,14 +379,31 @@ enum Indexer {
             store.exec("DELETE FROM content; DELETE FROM vecs; DELETE FROM files;")
             store.setMeta("model", string: modelTag)
             full = true
+            wrote = true
         }
         let incremental = !full && paths != nil
+        let rootList = roots()
+        let pathSet = Set(paths ?? [])
+        let listed = incremental ? pathSet.filter { d in rootList.contains(where: { d == $0 || d.hasPrefix($0 + "/") }) && start(d, roots: rootList) != nil } : []
 
         struct Old { let id: Int64; let mtime: Double; let size: Int; let kind: Int; let revision: String; let hash: String }
         var old: [String: Old] = [:]
-        store.run("SELECT id, path, mtime, size, kind, sourceRevision, contentHash FROM files") { st in
-            old[colText(st, 1)] = Old(id: sqlite3_column_int64(st, 0), mtime: sqlite3_column_double(st, 2), size: Int(sqlite3_column_int64(st, 3)),
-                                      kind: Int(sqlite3_column_int(st, 4)), revision: colText(st, 5), hash: colText(st, 6))
+        func loadOld(_ filter: String = "", _ args: [Any] = []) {
+            store.run("SELECT id, path, mtime, size, kind, sourceRevision, contentHash FROM files" + filter, args) { st in
+                old[colText(st, 1)] = Old(id: sqlite3_column_int64(st, 0), mtime: sqlite3_column_double(st, 2), size: Int(sqlite3_column_int64(st, 3)),
+                                          kind: Int(sqlite3_column_int(st, 4)), revision: colText(st, 5), hash: colText(st, 6))
+            }
+        }
+        // A file-change run only looks up or deletes rows under the folders it lists, and non-file rows (replaced
+        // whenever their source is read). A byte range ('0' sorts right after '/') matches Swift's string
+        // comparison only for ASCII folders, so any other spelling loads everything.
+        if incremental, listed.allSatisfy({ $0.utf8.allSatisfy { $0 < 0x80 } }) {
+            for d in listed where !listed.contains(where: { $0 != d && d.hasPrefix($0 + "/") }) {
+                loadOld(" WHERE path >= ? AND path < ?", [d + "/", d + "0"])
+            }
+            loadOld(" WHERE kind > ?", [Kind.folder.rawValue])
+        } else {
+            loadOld()
         }
 
         var cands: [Cand] = []
@@ -376,9 +411,8 @@ enum Indexer {
         var blind: [String] = []
         // incremental: the folders listed this run; only their direct entries (and vanished subfolders) may be deleted
         var scanned = Set<String>()
-        let rootList = roots()
-        if incremental, let paths {
-            for d in Set(paths) where rootList.contains(where: { d == $0 || d.hasPrefix($0 + "/") }) && start(d, roots: rootList) != nil {
+        if incremental {
+            for d in pathSet where listed.contains(d) {
                 scanned.insert(d)
                 let found = walk(d, recursive: false, roots: rootList, onError: { blind.append($0) })
                 cands += found
@@ -407,32 +441,35 @@ enum Indexer {
         var seen = Set<String>()
         cands = cands.filter { seen.insert($0.path).inserted }.sorted { $0.mtime > $1.mtime }
 
-        let isBlind = { (p: String) in blind.contains { p == $0 || p.hasPrefix($0 + "/") } }
-        let vanished = incremental ? old.filter { p, o in
+        let blindSet = Set(blind)
+        let isBlind = { (p: String) in blindSet.contains(p) || inside(p, blindSet) }
+        let vanished = incremental ? Set(old.filter { p, o in
             o.kind == Kind.folder.rawValue && !seen.contains(p) && scanned.contains((p as NSString).deletingLastPathComponent) && !isBlind(p)
-        }.map(\.key) : []
+        }.map(\.key)) : []
         func authoritative(_ p: String, _ o: Old) -> Bool {
             if keepKinds.contains(o.kind) || isBlind(p) { return false }
             guard incremental, Kind(rawValue: o.kind)?.isFile ?? true else { return true }
-            return scanned.contains((p as NSString).deletingLastPathComponent) || vanished.contains { p.hasPrefix($0 + "/") }
+            return scanned.contains((p as NSString).deletingLastPathComponent) || inside(p, vanished)
         }
         store.exec("BEGIN")
         for (path, o) in old where !seen.contains(path) && authoritative(path, o) {
             store.deleteFile(o.id)
+            wrote = true
         }
         store.exec("COMMIT")
 
-        let todo = cands.filter { c in
+        let todo = cands.map { ($0, $0.sourceRevision) }.filter { c, revision in
             guard let o = old[c.path] else { return true }
-            return o.mtime != c.mtime || o.size != c.size || o.revision != c.sourceRevision
+            return o.mtime != c.mtime || o.size != c.size || o.revision != revision
         }
+        if !todo.isEmpty { wrote = true }
         // Publish names first, before loading a model or extracting any content.
         // state: 3 = text pending, 4 = metadata only, 0 = media pending, 1 = complete, 2 = clipboard.
         store.exec("BEGIN")
-        for c in todo {
+        for (c, revision) in todo {
             guard let o = old[c.path] else {
                 store.run("INSERT INTO files(path,name,kind,mtime,size,state,snippet,sourceRevision) VALUES(?,?,?,?,?,?,?,?)",
-                          [c.path, c.name, c.kind.rawValue, c.mtime, c.size, c.semantic ? 3 : 4, c.body ?? "", c.sourceRevision])
+                          [c.path, c.name, c.kind.rawValue, c.mtime, c.size, c.semantic ? 3 : 4, c.body ?? "", revision])
                 continue
             }
             if c.body == nil, ![.folder, .app].contains(c.kind), o.kind == c.kind.rawValue, !o.hash.isEmpty, Extract.contentHash(c.path) == o.hash {
@@ -444,7 +481,7 @@ enum Indexer {
             store.run("""
             UPDATE files SET name=?,kind=?,mtime=?,size=?,state=?,snippet=COALESCE(?,snippet),sourceRevision=?,
                 textIndexed=0,attempts=0,retryAt=0,contentHash='' WHERE id=?
-            """, [c.name, c.kind.rawValue, c.mtime, c.size, c.semantic ? 3 : 4, c.body.map { $0 as Any } ?? NSNull(), c.sourceRevision, o.id])
+            """, [c.name, c.kind.rawValue, c.mtime, c.size, c.semantic ? 3 : 4, c.body.map { $0 as Any } ?? NSNull(), revision, o.id])
         }
         for (name, sig) in readSources {
             store.setMeta("source.\(name).read", string: String(now))
@@ -475,6 +512,7 @@ enum Indexer {
         store.run("SELECT id,path,kind FROM files WHERE textIndexed=0 AND state NOT IN (2,4) AND retryAt<=? AND kind IN (\(ids(textKinds))) ORDER BY mtime DESC", [now]) { st in
             contentPending.append((sqlite3_column_int64(st, 0), colText(st, 1), Kind(rawValue: Int(sqlite3_column_int(st, 2))) ?? .other))
         }
+        if !contentPending.isEmpty { wrote = true }
         progress.begin("text", total: contentPending.count)
         var speechLeft = 1800.0 // seconds of audio transcribed per run; the rest waits for the next one
         for (i, (id, path, kind)) in contentPending.enumerated() {
@@ -489,9 +527,7 @@ enum Indexer {
                 } else {
                     passages = Extract.keywordPassagesResult(url, kind: kind)
                 }
-                guard persistContentExtraction(store, id: id, passages: passages) else { _ = fail(id); return }
-                // the version whose text is now stored; a later touch with the same bytes keeps it
-                store.run("UPDATE files SET contentHash=? WHERE id=?", [Extract.contentHash(path) ?? "", id])
+                guard persistContentExtraction(store, id: id, passages: passages, hash: { Extract.contentHash(path) ?? "" }) else { _ = fail(id); return }
                 // new passages need their vectors even when the file's own text vector is current
                 if kind == .doc, (passages?.count ?? 0) > 1 { store.run("UPDATE files SET state=0 WHERE id=? AND state=1", [id]) }
             }
@@ -514,6 +550,7 @@ enum Indexer {
             if visionKinds.contains(k) { visionPending = true }
         }
         if textPending.isEmpty && mediaPending == 0 { return 0 }
+        wrote = true
         // the vision/audio encoders are only loaded when something will use them this run
         visionPending = vision && (visionPending || textPending.contains { visionKinds.contains($0.1.kind) })
         guard let emb = Embedder(multimodal: visionPending, nCtx: 1024) else { log("names searchable; content model unavailable"); return 1 }

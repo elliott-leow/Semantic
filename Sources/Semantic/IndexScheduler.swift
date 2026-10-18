@@ -9,6 +9,8 @@ private enum Watch {
     static var home: DispatchSourceFileSystemObject?
     static var store: Store?          // one read-only connection for progress polling
     static let maxDirs = 400          // beyond this a full walk is cheaper than listing each folder
+    static var generation: String??   // meta "generation" as of the last reload; nil before one
+    static var dirty = false          // a reload while indexing was skipped because the bar was hidden
 }
 
 // When the indexer child process runs, and how the bar learns about its progress.
@@ -43,7 +45,8 @@ extension AppDelegate {
                 self.indexer = nil
                 self.progressTimer?.invalidate()
                 self.bar.status = ""
-                Engine.shared.reloadIndex()
+                // a run cut short may have written rows without bumping the generation
+                self.reloadIndex(ifChanged: p.terminationReason == .exit && p.terminationStatus == 0)
                 if self.pendingIndex { self.pendingIndex = false; self.startIndexer() }
                 else if Watch.rescan || !Watch.dirs.isEmpty { self.scheduleChangedRun() }
             }
@@ -56,8 +59,24 @@ extension AppDelegate {
             guard let self, let s = Watch.store?.metaString("progress") else { return }
             self.bar.status = "Indexing \(s)"
             self.ticks += 1
-            if self.ticks == 1 || self.ticks % 8 == 0 { Engine.shared.reloadIndex() } // surface new results while indexing
+            // surface new results while indexing; a hidden bar catches up when it is shown
+            if self.ticks == 1 || self.ticks % 8 == 0 { if self.bar.isVisible { self.reloadIndex() } else { Watch.dirty = true } }
         }
+    }
+
+    // The indexer and the clipboard history write meta "generation" after changing rows, so an unchanged
+    // value means the loaded index is current. It is read before reloading: a later write changes it again.
+    func reloadIndex(ifChanged: Bool = false) {
+        if Watch.store == nil { Watch.store = Store(readonly: true) }
+        let gen = Watch.store.map { $0.metaString("generation") }
+        if ifChanged, let gen, let last = Watch.generation, gen == last { Watch.dirty = false; return }
+        Watch.generation = gen
+        Watch.dirty = false
+        Engine.shared.reloadIndex()
+    }
+
+    func reloadIfDirty() {
+        if Watch.dirty { reloadIndex() }
     }
 
     // One debounce for every batch of events: at least 5 s, and runs start at most once a minute.

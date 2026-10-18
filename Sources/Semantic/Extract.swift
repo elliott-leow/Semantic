@@ -232,8 +232,18 @@ enum Extract {
                 d += try h.read(upToCount: 65536) ?? Data()
             }
             d += Data(String(size).utf8)
-            return SHA256.hash(data: d).map { String(format: "%02x", $0) }.joined()
+            return hex(SHA256.hash(data: d))
         } catch { return nil }
+    }
+
+    private static let hexDigits = Array("0123456789abcdef".utf8)
+
+    // lowercase hex, as String(format: "%02x") per byte
+    static func hex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
+        var out: [UInt8] = []
+        out.reserveCapacity(64)
+        for b in bytes { out.append(hexDigits[Int(b >> 4)]); out.append(hexDigits[Int(b & 15)]) }
+        return String(decoding: out, as: UTF8.self)
     }
 
     static func unzipText(_ url: URL, member: String) -> String {

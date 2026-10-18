@@ -9,6 +9,8 @@ final class Store {
     static let schema: Int32 = 1
     private static let optimizeLock = NSLock()
     private static var optimized = 0.0
+    private var statements: [String: OpaquePointer] = [:]
+    private let cacheLock = NSLock()
 
     init?(readonly: Bool = false, path: String = Paths.db) {
         let flags = readonly ? SQLITE_OPEN_READONLY : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
@@ -58,6 +60,7 @@ final class Store {
             Self.optimizeLock.unlock()
             if due { exec("PRAGMA analysis_limit=400; PRAGMA optimize;") }
         }
+        for st in statements.values { sqlite3_finalize(st) }
         sqlite3_close(db)
     }
 
@@ -73,12 +76,23 @@ final class Store {
 
     // binds Int/Int64/Double/String/Data; calls row for each result row
     func run(_ sql: String, _ args: [Any] = [], row: ((OpaquePointer) -> Void)? = nil) {
-        var st: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK, let st else {
+        // a cached statement is taken out while it runs, so a nested run of the same SQL prepares its own
+        cacheLock.lock()
+        var st = statements.removeValue(forKey: sql)
+        cacheLock.unlock()
+        if st == nil, sqlite3_prepare_v2(db, sql, -1, &st, nil) != SQLITE_OK || st == nil {
             log("sqlite prepare: \(String(cString: sqlite3_errmsg(db))) in \(sql.prefix(80))")
+            sqlite3_finalize(st)
             return
         }
-        defer { sqlite3_finalize(st) }
+        guard let st else { return }
+        defer {
+            sqlite3_reset(st)
+            sqlite3_clear_bindings(st)
+            cacheLock.lock()
+            if statements[sql] == nil, statements.count < 64 { statements[sql] = st } else { sqlite3_finalize(st) }
+            cacheLock.unlock()
+        }
         for (i, a) in args.enumerated() {
             let n = Int32(i + 1)
             switch a {
@@ -109,6 +123,9 @@ final class Store {
     func setMeta(_ k: String, _ v: Data?) {
         if let v { run("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", [k, v]) } else { run("DELETE FROM meta WHERE k=?", [k]) }
     }
+
+    // after writing rows the bar loads: it reloads only when "generation" changed (AppDelegate.reloadIndex)
+    func bumpGeneration() { setMeta("generation", string: UUID().uuidString) }
 
     func metaString(_ k: String) -> String? { meta(k).flatMap { String(data: $0, encoding: .utf8) } }
     func setMeta(_ k: String, string: String?) { setMeta(k, string?.data(using: .utf8)) }
@@ -151,8 +168,14 @@ final class Store {
         return out
     }
 
+    // FTS5 can only find file_id by reading every row through the full-text table; its content shadow table
+    // (c0 = file_id) yields the same rowids several times faster, and rowid deletes are direct
+    func deleteContent(_ id: Int64) {
+        run("DELETE FROM content WHERE rowid IN (SELECT id FROM content_content WHERE c0=?)", [id])
+    }
+
     func deleteFile(_ id: Int64) {
-        run("DELETE FROM content WHERE file_id=?", [id])
+        deleteContent(id)
         run("DELETE FROM vecs WHERE file_id=?", [id])
         run("DELETE FROM files WHERE id=?", [id])
     }
