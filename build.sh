@@ -65,10 +65,10 @@ if [ "${1:-}" = "--test" ]; then
     SWIFT_EXTRA=(-D SEARCH_TESTS Tests/*.swift)
 fi
 mkdir -p $BUILD/obj $APP/Contents/MacOS
-clang++ -std=c++17 -O2 -mmacosx-version-min=14.0 -c Sources/shim/sb_embed.cpp -o $BUILD/obj/sb_embed.o \
+clang++ -std=c++17 -O3 -mmacosx-version-min=14.0 -c Sources/shim/sb_embed.cpp -o $BUILD/obj/sb_embed.o \
     -I$L/include -I$L/ggml/include -I$L/tools/mtmd
 
-swiftc -O -swift-version 5 -target arm64-apple-macos14.0 \
+swiftc -O -wmo -swift-version 5 -target arm64-apple-macos14.0 \
     -import-objc-header Sources/shim/sb_embed.h Sources/Semantic/*.swift ${SWIFT_EXTRA[@]+"${SWIFT_EXTRA[@]}"} $BUILD/obj/sb_embed.o \
     $L/build/tools/mtmd/libmtmd.a $L/build/src/libllama.a $L/build/ggml/src/libggml.a \
     $L/build/ggml/src/libggml-cpu.a $L/build/ggml/src/ggml-metal/libggml-metal.a \
