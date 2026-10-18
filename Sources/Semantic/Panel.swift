@@ -116,7 +116,7 @@ final class ChipView: NSView {
     // returns the width the chip wants
     func set(_ files: [String]) -> CGFloat {
         guard let first = files.first else { return 0 }
-        icon.image = NSWorkspace.shared.icon(forFile: first)
+        icon.image = RowIcons.icon(forFile: first)
         label.stringValue = files.count == 1 ? (first as NSString).lastPathComponent : "\(files.count) files"
         let w = min(230, label.intrinsicContentSize.width + 4)
         icon.frame = NSRect(x: 7, y: 5, width: 20, height: 20)
@@ -167,6 +167,8 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
     private var note = ""
     private var top: CGFloat = 0
     private let thumbs = NSCache<NSString, NSImage>()
+    private var thumbsLoading = Set<String>()
+    private var scopeSize: (text: String, font: NSFont?, width: CGFloat)?
     private var monitor: Any?
     private var flagsMonitor: Any?
     private var refineTimer: Timer?
@@ -449,6 +451,7 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
         listH = 0
         table.reloadData()
         RelativeDate.forget()
+        RowIcons.forget()
         if wasVisible { onHide?() }
     }
 
@@ -713,7 +716,10 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
         previewRule.frame = NSRect(x: listW + 15, y: footerH, width: 1, height: listArea)
         preview.frame = NSRect(x: listW + 16, y: footerH, width: width - listW - 16, height: listArea)
         summary.frame = NSRect(x: 22, y: h - fieldH - 23, width: width - 320, height: 16)
-        let scopeW = min(290, ceil(scope.attributedStringValue.size().width) + 4)
+        if scopeSize?.text != scope.stringValue || scopeSize?.font != scope.font {
+            scopeSize = (scope.stringValue, scope.font, scope.attributedStringValue.size().width)
+        }
+        let scopeW = min(290, ceil(scopeSize!.width) + 4)
         scope.frame = NSRect(x: width - 22 - scopeW, y: h - fieldH - 23, width: scopeW, height: 16)
         ring.frame = NSRect(x: scope.frame.minX - 17, y: h - fieldH - 21, width: 12, height: 12)
         empty.frame = NSRect(x: 22, y: footerH + 16, width: width - 44, height: 18)
@@ -801,7 +807,7 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
         if let i = RowIcons.image(for: h, loaded: {}) { return i }
         switch h.icon {
         case .symbol(let name): return symbol(name, 40)
-        case .file(let path): return NSWorkspace.shared.icon(forFile: path)
+        case .file(let path): return RowIcons.icon(forFile: path)
         }
     }
 
@@ -1694,7 +1700,7 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
             v.icon.contentTintColor = .secondaryLabelColor
         case .file(let path):
             v.icon.contentTintColor = nil
-            v.icon.image = thumbs.object(forKey: path as NSString) ?? NSWorkspace.shared.icon(forFile: path)
+            v.icon.image = thumbs.object(forKey: path as NSString) ?? RowIcons.icon(forFile: path)
             let k = Extract.kind(ext: (path as NSString).pathExtension.lowercased())
             if [.image, .video, .doc].contains(k), thumbs.object(forKey: path as NSString) == nil { thumbnail(path) }
         }
@@ -1702,12 +1708,16 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
     }
 
     private func thumbnail(_ path: String) {
+        // one request per file while it is in flight; a failed one is asked again on the next draw
+        guard thumbsLoading.insert(path).inserted else { return }
         let req = QLThumbnailGenerator.Request(fileAt: URL(fileURLWithPath: path), size: CGSize(width: 60, height: 60),
                                                scale: 2, representationTypes: .thumbnail)
         QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { [weak self] rep, _ in
-            guard let img = rep?.nsImage else { return }
+            let img = rep?.nsImage
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.thumbsLoading.remove(path)
+                guard let img else { return }
                 self.thumbs.setObject(img, forKey: path as NSString)
                 for (i, h) in self.hits.enumerated() {
                     if case .file(let p) = h.icon, p == path, let r = self.row(of: i) {

@@ -4,9 +4,11 @@
 #include "mtmd.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
+#include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
 #if defined(__ARM_FEATURE_DOTPROD)
 #include <arm_neon.h>
@@ -29,6 +31,7 @@ struct sb_ctx {
     int               n_ctx = 0;
     // media embeddings must outlive llama_process()
     std::vector<std::vector<float>> held;
+    std::vector<llama_token>        toks;
 };
 
 static void quiet_log(enum ggml_log_level level, const char * text, void *) {
@@ -112,7 +115,8 @@ static bool add_tokens(sb_ctx * c, const llama_token * toks, size_t n, llama_pos
 
 int sb_embed_text(sb_ctx * c, const char * text, float * out) {
     const llama_vocab * vocab = llama_model_get_vocab(c->model);
-    std::vector<llama_token> toks(c->n_ctx + 8);
+    std::vector<llama_token> & toks = c->toks;
+    toks.resize(c->n_ctx + 8);
     int len = (int) strlen(text);
     int n = llama_tokenize(vocab, text, len, toks.data(), (int) toks.size(), true, true);
     while (n < 0 && len > 16) {
@@ -200,6 +204,55 @@ void sb_scan_i8_ref(const float * q, const int8_t * docs, size_t n, float * out)
     }
 }
 
+#if defined(__ARM_FEATURE_DOTPROD)
+struct scan_job {
+    const int8_t * hi; const int8_t * lo;
+    float a, b;
+    const int8_t * docs; float * out;
+    size_t n, chunk;
+};
+static const size_t SCAN_PAR_MIN = 16384;
+
+// Four rows per pass share the query loads. Each row keeps its own accumulators and the same final
+// float expression; the integer sums are exact, so every score is bit-identical to one row at a time.
+static void scan_rows(const scan_job & j, size_t r, size_t end) {
+    const int8_t * hi = j.hi, * lo = j.lo;
+    const float a = j.a, b = j.b;
+    for (; r + 4 <= end; r += 4) {
+        const int8_t * d = j.docs + r * SB_DIM;
+        __builtin_prefetch(d + 4 * SB_DIM);
+        __builtin_prefetch(d + 4 * SB_DIM + 512);
+        __builtin_prefetch(d + 4 * SB_DIM + 1024);
+        __builtin_prefetch(d + 4 * SB_DIM + 1536);
+        int32x4_t h[4], l[4];
+        for (int k = 0; k < 4; k++) h[k] = l[k] = vdupq_n_s32(0);
+        for (int i = 0; i < SB_DIM; i += 16) {
+            int8x16_t qh = vld1q_s8(hi + i), ql = vld1q_s8(lo + i);
+            for (int k = 0; k < 4; k++) {
+                int8x16_t dv = vld1q_s8(d + k * SB_DIM + i);
+                h[k] = vdotq_s32(h[k], qh, dv);
+                l[k] = vdotq_s32(l[k], ql, dv);
+            }
+        }
+        for (int k = 0; k < 4; k++) {
+            float sh = (float) vaddvq_s32(h[k]), sl = (float) vaddvq_s32(l[k]);
+            j.out[r + k] = a * sh + b * sl;
+        }
+    }
+    for (; r < end; r++) {
+        const int8_t * d = j.docs + r * SB_DIM;
+        int32x4_t h0 = vdupq_n_s32(0), l0 = h0;
+        for (int i = 0; i < SB_DIM; i += 16) {
+            int8x16_t dv = vld1q_s8(d + i);
+            h0 = vdotq_s32(h0, vld1q_s8(hi + i), dv);
+            l0 = vdotq_s32(l0, vld1q_s8(lo + i), dv);
+        }
+        float sh = (float) vaddvq_s32(h0), sl = (float) vaddvq_s32(l0);
+        j.out[r] = a * sh + b * sl;
+    }
+}
+#endif
+
 void sb_scan_i8(const float * q, const int8_t * docs, size_t n, float * out) {
 #if defined(__ARM_FEATURE_DOTPROD)
     float m = 0;
@@ -215,19 +268,16 @@ void sb_scan_i8(const float * q, const int8_t * docs, size_t n, float * out) {
         hi[i] = (int8_t) h;
         lo[i] = (int8_t) std::lround((v - h) * 254.0f);
     }
-    const float a = 1.0f / s, b = a / 254.0f;
-    for (size_t r = 0; r < n; r++) {
-        const int8_t * d = docs + r * SB_DIM;
-        int32x4_t h0 = vdupq_n_s32(0), h1 = h0, l0 = h0, l1 = h0;
-        for (int i = 0; i < SB_DIM; i += 32) {
-            int8x16_t d0 = vld1q_s8(d + i), d1 = vld1q_s8(d + i + 16);
-            h0 = vdotq_s32(h0, vld1q_s8(hi + i), d0);
-            h1 = vdotq_s32(h1, vld1q_s8(hi + i + 16), d1);
-            l0 = vdotq_s32(l0, vld1q_s8(lo + i), d0);
-            l1 = vdotq_s32(l1, vld1q_s8(lo + i + 16), d1);
-        }
-        out[r] = a * (float) vaddvq_s32(vaddq_s32(h0, h1)) + b * (float) vaddvq_s32(vaddq_s32(l0, l1));
-    }
+    scan_job j = { hi, lo, 1.0f / s, 1.0f / s / 254.0f, docs, out, n, 0 };
+    // rows are independent, so splitting them across cores changes no score
+    if (n < SCAN_PAR_MIN) { scan_rows(j, 0, n); return; }
+    int parts = sb_threads();
+    j.chunk = (n + parts - 1) / parts;
+    dispatch_apply_f(parts, DISPATCH_APPLY_AUTO, &j, [](void * p, size_t k) {
+        auto & j = *(scan_job *) p;
+        size_t r0 = k * j.chunk, r1 = std::min(j.n, r0 + j.chunk);
+        if (r0 < r1) scan_rows(j, r0, r1);
+    });
 #else
     sb_scan_i8_ref(q, docs, n, out);
 #endif

@@ -1,3 +1,4 @@
+import Accelerate
 import CoreGraphics
 import Foundation
 
@@ -43,13 +44,14 @@ final class Embedder {
         c.setFillColor(CGColor(gray: 1, alpha: 1))
         c.fill(CGRect(x: 0, y: 0, width: w, height: h))
         c.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-        let rgba = px.bindMemory(to: UInt8.self, capacity: w * h * 4)
-        var rgb = [UInt8](repeating: 0, count: w * h * 3)
-        for i in 0..<(w * h) {
-            rgb[i * 3] = rgba[i * 4]
-            rgb[i * 3 + 1] = rgba[i * 4 + 1]
-            rgb[i * 3 + 2] = rgba[i * 4 + 2]
+        var ok = false
+        let rgb = [UInt8](unsafeUninitializedCapacity: w * h * 3) { dst, count in
+            var s = vImage_Buffer(data: px, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 4)
+            var d = vImage_Buffer(data: dst.baseAddress, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 3)
+            ok = vImageConvert_RGBA8888toRGB888(&s, &d, vImage_Flags(kvImageNoFlags)) == kvImageNoError
+            count = ok ? w * h * 3 : 0
         }
+        guard ok else { return nil }
         var out = [Float](repeating: 0, count: DIM)
         return sb_embed_image(ctx, rgb, Int32(w), Int32(h), &out) == 0 ? out : nil
     }

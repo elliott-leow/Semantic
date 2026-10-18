@@ -42,12 +42,15 @@ enum Marked {
     }
 
     private static let stop: Set<String> = ["the", "a", "an", "of", "in", "on", "my", "to", "for", "and", "from", "with", "at", "is", "it", "me"]
+    private static let quotes = CharacterSet(charactersIn: "\"'“”*")
+    private static let alnum = CharacterSet.alphanumerics, lower = CharacterSet.lowercaseLetters, upper = CharacterSet.uppercaseLetters
+    private static let letters = CharacterSet.letters, digits = CharacterSet.decimalDigits
 
     // typed words that start a word of the title (case and accent insensitive); filters like ext:pdf are not words
     static func tokens(_ query: String) -> [String] {
         query.lowercased().split(whereSeparator: { $0.isWhitespace }).map(String.init)
             .filter { !$0.contains(":") && !stop.contains($0) }
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”*")) }.filter { !$0.isEmpty }
+            .map { $0.trimmingCharacters(in: quotes) }.filter { !$0.isEmpty }
     }
 
     static func ranges(of query: String, in text: String) -> [NSRange] {
@@ -67,12 +70,10 @@ enum Marked {
 
     private static func boundary(_ ns: NSString, _ i: Int) -> Bool {
         let prev = ns.character(at: i - 1), cur = ns.character(at: i)
-        let alnum = CharacterSet.alphanumerics
         guard let p = Unicode.Scalar(prev), let c = Unicode.Scalar(cur) else { return true }
         if !alnum.contains(p) { return true }
         // camelCase and digits after letters start a new word too
-        return CharacterSet.lowercaseLetters.contains(p) && CharacterSet.uppercaseLetters.contains(c)
-            || CharacterSet.letters.contains(p) && CharacterSet.decimalDigits.contains(c)
+        return lower.contains(p) && upper.contains(c) || letters.contains(p) && digits.contains(c)
     }
 
     static func title(_ s: String, query: String, font: NSFont, strong: NSFont, color: NSColor) -> NSAttributedString {
@@ -89,6 +90,7 @@ enum RelativeDate {
     private static let day: DateFormatter = { let f = DateFormatter(); f.dateFormat = "d MMM"; return f }()
     private static let weekday: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE"; return f }()
     private static var mtimes: [String: Date] = [:]
+    private static let stamp = try! NSRegularExpression(pattern: "\\b\\d{1,2} [A-Z][a-z]{2,4} \\d{4}\\b")
 
     static func text(_ d: Date, now: Date = Date()) -> String {
         let s = now.timeIntervalSince(d), cal = Calendar.current
@@ -103,7 +105,8 @@ enum RelativeDate {
 
     // `date` is the time the engine formatted into the subtitle; without it the file is asked
     static func rewrite(_ subtitle: String, path: String?, date: Double? = nil, now: Date = Date()) -> String {
-        guard let r = subtitle.range(of: "\\b\\d{1,2} [A-Z][a-z]{2,4} \\d{4}\\b", options: .regularExpression) else { return subtitle }
+        guard let found = stamp.firstMatch(in: subtitle, range: NSRange(subtitle.startIndex..., in: subtitle)),
+              let r = Range(found.range, in: subtitle) else { return subtitle }
         let m: Date
         if let date, date > 0 { m = Date(timeIntervalSince1970: date) }
         else if let path, let c = mtimes[path] { m = c } else {
@@ -153,6 +156,13 @@ final class RowView: NSTableCellView {
     var showWhy = false
     var hasExcerpt: Bool { !excerptText.isEmpty }
     private var selected = false
+    // what select() last rendered; the same inputs render the same strings, so they are not rebuilt
+    private struct Shown: Equatable {
+        var selected: Bool, isFile: Bool, pending: Bool, unavailable: Bool, showShortcut: Bool, showWhy: Bool, shortcut: Int
+        var label: String, titleText: String, query: String, subtitleText: String, why: String, excerptText: String
+        var appearance: NSAppearance.Name
+    }
+    private var shown: Shown?
 
     static let titleFont = NSFont.systemFont(ofSize: 15, weight: .medium)
     static let titleStrong = NSFont.systemFont(ofSize: 15, weight: .bold)
@@ -178,6 +188,11 @@ final class RowView: NSTableCellView {
     required init?(coder: NSCoder) { fatalError() }
 
     func select(_ selected: Bool) {
+        let now = Shown(selected: selected, isFile: isFile, pending: pending, unavailable: unavailable, showShortcut: showShortcut, showWhy: showWhy,
+                        shortcut: shortcut, label: label, titleText: titleText, query: query, subtitleText: subtitleText, why: why,
+                        excerptText: excerptText, appearance: effectiveAppearance.name)
+        guard now != shown else { return }
+        shown = now
         self.selected = selected
         let main: NSColor = selected ? .alternateSelectedControlTextColor : .labelColor
         let secondary: NSColor = selected ? .alternateSelectedControlTextColor.withAlphaComponent(0.85) : .secondaryLabelColor
