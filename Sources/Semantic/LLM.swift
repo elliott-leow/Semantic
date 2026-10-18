@@ -5,11 +5,11 @@ import Foundation
 final class LLM {
     static let shared = LLM()
 
-    private let queue = DispatchQueue(label: "sembar.llm", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "semantic.llm", qos: .userInitiated)
     private var ctx: OpaquePointer?
     private var unload: DispatchWorkItem?
 
-    static var path: String { ProcessInfo.processInfo.environment["SEMBAR_LLM"] ?? Paths.llm }
+    static var path: String { ProcessInfo.processInfo.environment["SEMANTIC_LLM"] ?? Paths.llm }
     static var available: Bool { FileManager.default.fileExists(atPath: path) }
 
     // {"action": "...", "key": "string" | number, ...}

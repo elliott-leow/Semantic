@@ -5,12 +5,12 @@ import SQLite3
 // Isolated executable: ./build.sh --test. Never opens, modifies or indexes the user's files.
 enum SearchTests {
     static func run() {
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("sembar-tests-" + UUID().uuidString)
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("semantic-tests-" + UUID().uuidString)
         try! FileManager.default.createDirectory(at: tempURL, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempURL) }
         let temp = tempURL.resolvingSymlinksInPath()
-        setenv("SEMBAR_DATA_DIR", temp.appendingPathComponent("data").path, 1)
-        setenv("SEMBAR_CONFIG_PATH", temp.appendingPathComponent("config.json").path, 1)
+        setenv("SEMANTIC_DATA_DIR", temp.appendingPathComponent("data").path, 1)
+        setenv("SEMANTIC_CONFIG_PATH", temp.appendingPathComponent("config.json").path, 1)
         let root = temp.appendingPathComponent("files")
         try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let cfg: [String: Any] = ["roots": [root.path], "sources": [], "clipboard": false]
@@ -137,7 +137,7 @@ enum SearchTests {
         let aspirinEngine = Engine(index: Index.load(store: db))
         check(aspirinEngine.build("asprin").hits.first { $0.path != nil }?.path == fixture.path, "asprin filename typo outranks an incidental exact body mention")
         let fileHit = Hit(title: "Aspirin", subtitle: "", icon: .file(fixture.path), tag: "Document", path: fixture.path) { _ in }
-        let dragBoard = NSPasteboard(name: .init("SemBar.test.drag." + UUID().uuidString))
+        let dragBoard = NSPasteboard(name: .init("Semantic.test.drag." + UUID().uuidString))
         dragBoard.clearContents()
         if let writer = BarController.dragWriter(fileHit) { dragBoard.writeObjects([writer]) }
         check((dragBoard.readObjects(forClasses: [NSURL.self]) as? [URL])?.first?.path == fixture.path, "outbound result drag exposes original file URL")

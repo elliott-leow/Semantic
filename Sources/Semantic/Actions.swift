@@ -23,6 +23,7 @@ struct Hit {
     var unavailableReason: String?
     var stay = false      // keep the bar open after running
     var promote = false   // a refined row that should move to the top
+    var why = ""          // how the score was made up ("name 16 · meaning 2.1 · habit 1"), shown while ⌥ is held
     // asks the language model for a better version of this row; nil means keep it
     var refine: ((@escaping (Hit?) -> Void) -> Void)?
     let run: (_ alt: Bool) -> Void
@@ -210,16 +211,16 @@ enum Actions {
         command("logout", "Log Out…", "rectangle.portrait.and.arrow.right", ["sign out of my account"]) {
             Sys.script("tell application \"loginwindow\" to «event aevtrlgo»")
         },
-        command("reindex", "Reindex Files", "arrow.triangle.2.circlepath", ["sembar reindex", "rebuild the search index", "rescan my files"]) {
+        command("reindex", "Reindex Files", "arrow.triangle.2.circlepath", ["semantic reindex", "rebuild the search index", "rescan my files"]) {
             AppDelegate.shared?.startIndexer()
         },
-command("autopaste", "Let SemBar Paste into ChatGPT", "hand.tap", ["enable automatic paste into chatgpt", "allow sembar accessibility",
+command("autopaste", "Let Semantic Paste into ChatGPT", "hand.tap", ["enable automatic paste into chatgpt", "allow semantic accessibility",
                                                                             "attach images to chatgpt automatically"]) {
             if AXIsProcessTrusted() { Toast.show("Already allowed") } else {
                 _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
             }
         },
-                command("quit", "Quit SemBar", "xmark.circle", ["exit sembar", "close the search bar app"]) { NSApp.terminate(nil) },
+                command("quit", "Quit Semantic", "xmark.circle", ["exit semantic", "close the search bar app"]) { NSApp.terminate(nil) },
 
         settings("Wi-Fi", "com.apple.wifi-settings-extension", "wifi", ["connect to a wireless network", "wifi"]),
         settings("Bluetooth", "com.apple.BluetoothSettings", "dot.radiowaves.left.and.right", ["pair bluetooth headphones", "bluetooth"]),

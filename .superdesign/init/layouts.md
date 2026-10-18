@@ -1,5 +1,5 @@
 # Search bar layout
-Sources/SemBar/Panel.swift contains the single native floating search panel.
+Sources/Semantic/Panel.swift contains the single native floating search panel.
 ```swift
 import AppKit
 import QuickLookThumbnailing
@@ -467,7 +467,7 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
         Sys.shell("/usr/bin/qlmanage", ["-p", path])
     }
 
-    // Exercises the real controls without any synthetic input (`SemBar --selftest file`): typing through the
+    // Exercises the real controls without any synthetic input (`Semantic --selftest file`): typing through the
     // field editor, a drop delivered to each drop target's handler, and what Return would run.
     func selfTest(_ file: String, report: @escaping ([String]) -> Void) {
         var out: [String] = []
@@ -485,7 +485,7 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
             out.append("typed “ifp syllabus” -> field “\(self.field.stringValue)”, top row \(first())")
             self.field.stringValue = ""
             // the same call the field editor, the rows and the background make when something is dropped on them
-            let pb = NSPasteboard(name: NSPasteboard.Name("sembar.selftest"))
+            let pb = NSPasteboard(name: NSPasteboard.Name("semantic.selftest"))
             pb.clearContents()
             pb.writeObjects([URL(fileURLWithPath: file) as NSURL])
             out.append("drop accepted: \(Drops.accept(pb)), attached: \(self.chips.map { ($0 as NSString).lastPathComponent })")

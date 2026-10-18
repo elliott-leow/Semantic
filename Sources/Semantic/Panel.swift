@@ -189,19 +189,41 @@ final class ChipView: NSView {
 }
 
 // A short confirmation that outlives the bar ("✓ Converted to JPEG → photo.jpg").
+// With an action ("Undo"), the toast takes clicks on its button and stays a little longer.
 enum Toast {
+    struct Action {
+        let title: String
+        let run: () -> Void
+    }
+
+    private final class Target: NSObject {
+        var action: Action?
+        @objc func fire() {
+            let a = action
+            action = nil
+            Toast.hide()
+            a?.run()
+        }
+    }
+
     private static var panel: NSPanel?
     private static var label: NSTextField?
+    private static var button: NSButton?
+    private static let target = Target()
     private static var timer: Timer?
 
-    static func show(_ text: String, seconds: Double = 2.4, sticky: Bool = false) {
+    static func hide() {
+        timer?.invalidate()
+        panel?.orderOut(nil)
+    }
+
+    static func show(_ text: String, seconds: Double = 2.4, sticky: Bool = false, action: Action? = nil) {
         if panel == nil {
             let p = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
             p.level = .floating
             p.isOpaque = false
             p.backgroundColor = .clear
             p.hasShadow = true
-            p.ignoresMouseEvents = true
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
             let fx = NSVisualEffectView()
             fx.material = .hudWindow
@@ -214,19 +236,34 @@ enum Toast {
             l.font = .systemFont(ofSize: 13.5, weight: .medium)
             l.lineBreakMode = .byTruncatingMiddle
             fx.addSubview(l)
+            let b = NSButton(title: "", target: target, action: #selector(Target.fire))
+            b.bezelStyle = .rounded
+            b.controlSize = .small
+            b.font = .systemFont(ofSize: 12, weight: .semibold)
+            fx.addSubview(b)
             p.contentView = fx
-            (panel, label) = (p, l)
+            (panel, label, button) = (p, l, b)
         }
-        guard let panel, let label else { return }
+        guard let panel, let label, let button else { return }
+        target.action = action
         label.stringValue = text
-        let w = min(560, label.intrinsicContentSize.width + 36)
+        button.title = action?.title ?? ""
+        button.isHidden = action == nil
+        panel.ignoresMouseEvents = action == nil
+        let buttonW: CGFloat = action == nil ? 0 : max(56, button.intrinsicContentSize.width + 12)
+        let w = min(600, label.intrinsicContentSize.width + 36 + (action == nil ? 0 : buttonW + 10))
         let mouse = NSEvent.mouseLocation
         let vf = (NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main)?.visibleFrame ?? .zero
         panel.setFrame(NSRect(x: vf.midX - w / 2, y: vf.maxY - vf.height * 0.2 - 40, width: w, height: 38), display: true)
-        label.frame = NSRect(x: 18, y: 10, width: w - 36, height: 18)
+        label.frame = NSRect(x: 18, y: 10, width: w - 36 - (action == nil ? 0 : buttonW + 10), height: 18)
+        button.frame = NSRect(x: w - 14 - buttonW, y: 7, width: buttonW, height: 24)
         panel.orderFrontRegardless()
         timer?.invalidate()
-        timer = sticky ? nil : Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { _ in panel.orderOut(nil) }
+        let shown = action == nil ? seconds : max(seconds, 6)
+        timer = sticky ? nil : Timer.scheduledTimer(withTimeInterval: shown, repeats: false) { _ in
+            target.action = nil
+            panel.orderOut(nil)
+        }
     }
 }
 
@@ -733,7 +770,7 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
         Sys.shell("/usr/bin/qlmanage", ["-p", path])
     }
 
-    // Exercises the real controls without any synthetic input (`SemBar --selftest file`): typing through the
+    // Exercises the real controls without any synthetic input (`Semantic --selftest file`): typing through the
     // field editor, a drop delivered to each drop target's handler, and what Return would run.
     func selfTest(_ file: String, report: @escaping ([String]) -> Void) {
         var out: [String] = []
@@ -751,7 +788,7 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
             out.append("typed “ifp syllabus” -> field “\(self.field.stringValue)”, top row \(first())")
             self.field.stringValue = ""
             // the same call the field editor, the rows and the background make when something is dropped on them
-            let pb = NSPasteboard(name: NSPasteboard.Name("sembar.selftest"))
+            let pb = NSPasteboard(name: NSPasteboard.Name("semantic.selftest"))
             pb.clearContents()
             pb.writeObjects([URL(fileURLWithPath: file) as NSURL])
             out.append("drop accepted: \(Drops.accept(pb)), attached: \(self.chips.map { ($0 as NSString).lastPathComponent })")

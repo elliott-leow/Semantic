@@ -683,7 +683,7 @@ enum Calc {
     }
 }
 
-// Daily exchange rates, cached on disk; the only network request SemBar makes.
+// Daily exchange rates, cached on disk; the only network request Semantic makes.
 enum Rates {
     private static let lock = NSLock()
     private static var rates: [String: Double]?

@@ -115,13 +115,13 @@ struct SearchResult {
 final class Engine {
     static let shared = Engine()
 
-    private let queue = DispatchQueue(label: "sembar.engine", qos: .userInteractive)
-    private let quickQueue = DispatchQueue(label: "sembar.file-search", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "semantic.engine", qos: .userInteractive)
+    private let quickQueue = DispatchQueue(label: "semantic.file-search", qos: .userInteractive)
     private var quickIndex: Index
     private static let onQueue = DispatchSpecificKey<Bool>()
     private var index = Index()
     private var embedder: Embedder?
-    private let warmQueue = DispatchQueue(label: "sembar.model-load", qos: .userInitiated)
+    private let warmQueue = DispatchQueue(label: "semantic.model-load", qos: .userInitiated)
     private var warming = false
     private var modelGeneration = 0
     private var intents: [Intent] = Actions.all + Commands.intents + [Assistant.intent]

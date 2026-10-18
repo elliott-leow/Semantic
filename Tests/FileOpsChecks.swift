@@ -49,7 +49,7 @@ enum FileOpsChecks {
             let lockedFile = locked.appendingPathComponent("source.txt")
             try "locked fixture".write(to: lockedFile, atomically: true, encoding: .utf8)
             func stagingNames() -> Set<String> {
-                Set(((try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? []).filter { $0.hasPrefix("SemBar-archive-") })
+                Set(((try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? []).filter { $0.hasPrefix("Semantic-archive-") })
             }
             let beforeStaging = stagingNames()
             try fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: locked.path)

@@ -134,7 +134,7 @@ enum Assistant {
         }
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
-            recover("Allow SemBar in Privacy & Security → Screen & System Audio Recording, then retry capture. Your question is saved below.")
+            recover("Allow Semantic in Privacy & Security → Screen & System Audio Recording, then retry capture. Your question is saved below.")
             return
         }
         let path = Paths.tmp + "/Screen \(UUID().uuidString).png"

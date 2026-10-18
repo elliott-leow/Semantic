@@ -10,14 +10,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     var bar: BarController!
     private var clipCount = NSPasteboard.general.changeCount
-    private var indexer: Process?
-    private var lastIndexRun = Date.distantPast
-    private var pendingIndex = false
-    private var progressTimer: Timer?
+    var indexer: Process?
+    var lastIndexRun = Date.distantPast
+    var pendingIndex = false
+    var progressTimer: Timer?
     private var unloadTimer: Timer?
     private var hotKey: EventHotKeyRef?
-    private var stream: FSEventStreamRef?
-    private var ticks = 0
+    var stream: FSEventStreamRef?
+    var ticks = 0
     private var frontApp: (path: String, since: Date)?
     private var settledApp: String?
 
@@ -61,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _exit(0)
     }
 
-    // `open -a SemBar` while running shows the bar
+    // `open -a Semantic` while running shows the bar
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !bar.isVisible { toggle() }
         return false
@@ -143,52 +143,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let id = EventHotKeyID(signature: OSType(0x53454D42), id: 1) // 'SEMB'
         let rc = RegisterEventHotKey(UInt32(kVK_ANSI_Y), UInt32(cmdKey), id, GetApplicationEventTarget(), 0, &hotKey)
         if rc != noErr { log("could not register cmd+Y (\(rc))") }
-    }
-
-    func startIndexer() {
-        guard indexer == nil, let exe = Bundle.main.executablePath else { pendingIndex = indexer != nil; return }
-        lastIndexRun = Date()
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: exe)
-        p.arguments = ["--index"]
-        p.qualityOfService = .utility
-        p.terminationHandler = { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.indexer = nil
-                self.progressTimer?.invalidate()
-                self.bar.status = ""
-                Engine.shared.reloadIndex()
-                if self.pendingIndex { self.pendingIndex = false; self.startIndexer() }
-            }
-        }
-        guard (try? p.run()) != nil else { return }
-        indexer = p
-        ticks = 0
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            guard let self, let s = Store(readonly: true)?.metaString("progress") else { return }
-            self.bar.status = "Indexing \(s)"
-            self.ticks += 1
-            if self.ticks == 1 || self.ticks % 8 == 0 { Engine.shared.reloadIndex() } // surface new results while indexing
-        }
-    }
-
-    private func watchFiles() {
-        let roots = Indexer.roots() as CFArray
-        let cb: FSEventStreamCallback = { _, _, _, _, _, _ in
-            DispatchQueue.main.async {
-                guard let d = AppDelegate.shared else { return }
-                let wait = max(0, 60 - Date().timeIntervalSince(d.lastIndexRun))
-                DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
-                    if Date().timeIntervalSince(d.lastIndexRun) >= 60 { d.startIndexer() }
-                }
-            }
-        }
-        guard let s = FSEventStreamCreate(nil, cb, nil, roots, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 15,
-                                          FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone)) else { return }
-        FSEventStreamSetDispatchQueue(s, .main)
-        FSEventStreamStart(s)
-        stream = s
     }
 }
 
@@ -274,6 +228,10 @@ if let i = args.firstIndex(of: "--calc") {
         print(String(format: "%-44@ %@", q as NSString, (r.map { "\($0.title)   [\($0.detail)]" } ?? "—") as NSString))
     }
     exit(0)
+}
+if args.contains("--eval") {
+    // replays what was picked for past queries and reports how highly the current ranking puts it
+    exit(RankingEval.run(verbose: args.contains("--verbose")))
 }
 if args.contains("--suggest") {
     // debugging aid: what the empty bar would offer now, and the habit strength behind each row

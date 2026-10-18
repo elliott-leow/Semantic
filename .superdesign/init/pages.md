@@ -1,5 +1,5 @@
 # Search panel
-Entry: Sources/SemBar/Panel.swift
+Entry: Sources/Semantic/Panel.swift
 - RowView, ChipView, DropView, BarEditor, Toast (same file)
 - Search.swift: SearchResult/Engine and ranking
 - Actions.swift: Hit/Icon

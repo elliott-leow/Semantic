@@ -85,7 +85,7 @@ enum Commands {
         return Hit(title: "Remind me: \(title)", subtitle: sub, icon: .symbol("checklist"), tag: "Reminder", key: "intent:reminder") { _ in
             store.requestFullAccessToReminders { ok, _ in
                 DispatchQueue.main.async {
-                    guard ok, let cal = store.defaultCalendarForNewReminders() else { return Toast.show("✗ SemBar needs access to Reminders", seconds: 4) }
+                    guard ok, let cal = store.defaultCalendarForNewReminders() else { return Toast.show("✗ Semantic needs access to Reminders", seconds: 4) }
                     let r = EKReminder(eventStore: store)
                     r.title = title
                     r.calendar = cal
@@ -117,7 +117,7 @@ enum Commands {
             guard let start else { return Toast.show("✗ Say when, e.g. “friday 1pm”", seconds: 4) }
             store.requestFullAccessToEvents { ok, _ in
                 DispatchQueue.main.async {
-                    guard ok, let cal = store.defaultCalendarForNewEvents else { return Toast.show("✗ SemBar needs access to Calendar", seconds: 4) }
+                    guard ok, let cal = store.defaultCalendarForNewEvents else { return Toast.show("✗ Semantic needs access to Calendar", seconds: 4) }
                     let e = EKEvent(eventStore: store)
                     e.title = title
                     e.calendar = cal

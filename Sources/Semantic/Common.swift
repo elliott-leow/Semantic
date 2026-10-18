@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 enum Kind: Int {
     case app = 0, image, audio, video, doc, other, folder
@@ -42,12 +43,24 @@ struct Config: Codable {
     var finderSelection: Bool? // attach the Finder selection when the bar opens over Finder (default true)
     var sources: [String]?     // any of: web, calendar, contacts, notes (default all)
     var assistant: String?     // "app" by default when installed; "web" explicitly uses the browser
+    var hotkey: String?        // e.g. "cmd+y" (default), "alt+space", "cmd+shift+space"
+    var excludes: [String]?    // folders (~ allowed) or glob patterns never indexed, e.g. "~/Private", "*.secret"
+    var clipboardDays: Double? // clipboard rows older than this are dropped (default 30)
+    var clipboardIgnoreApps: [String]? // bundle identifiers whose copies are never kept
+    var reduceIndexingOnBattery: Bool? // defer image/audio/video work on battery or when hot (default true)
 }
 
 enum Paths {
     static let home = FileManager.default.homeDirectoryForCurrentUser.path
     static let support: String = {
-        let p = ProcessInfo.processInfo.environment["SEMBAR_DATA_DIR"] ?? home + "/Library/Application Support/SemBar"
+        let fm = FileManager.default
+        if let p = ProcessInfo.processInfo.environment["SEMANTIC_DATA_DIR"] {
+            try? fm.createDirectory(atPath: p + "/models", withIntermediateDirectories: true)
+            return p
+        }
+        let p = home + "/Library/Application Support/Semantic", old = home + "/Library/Application Support/SemBar"
+        // the app was called SemBar; keep its index and downloaded models
+        if !fm.fileExists(atPath: p), fm.fileExists(atPath: old) { try? fm.moveItem(atPath: old, toPath: p) }
         try? FileManager.default.createDirectory(atPath: p + "/models", withIntermediateDirectories: true)
         return p
     }()
@@ -61,7 +74,11 @@ enum Paths {
         try? FileManager.default.createDirectory(atPath: p, withIntermediateDirectories: true)
         return p
     }()
-    static let config = ProcessInfo.processInfo.environment["SEMBAR_CONFIG_PATH"] ?? home + "/.config/sembar/config.json"
+    static let config: String = {
+        if let p = ProcessInfo.processInfo.environment["SEMANTIC_CONFIG_PATH"] { return p }
+        let p = home + "/.config/semantic/config.json", old = home + "/.config/sembar/config.json"
+        return !FileManager.default.fileExists(atPath: p) && FileManager.default.fileExists(atPath: old) ? old : p
+    }()
 
     static func tilde(_ p: String) -> String {
         p.hasPrefix(home) ? "~" + p.dropFirst(home.count) : p
@@ -75,7 +92,7 @@ let config: Config = {
 }()
 
 // database writes that must never hold up typing
-let ioQueue = DispatchQueue(label: "sembar.io", qos: .utility)
+let ioQueue = DispatchQueue(label: "semantic.io", qos: .utility)
 
 func quantize(_ v: [Float]) -> Data {
     var out = Data(count: v.count)
@@ -93,6 +110,10 @@ func nameTokens(_ s: String) -> [String] {
     s.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init)
 }
 
+let logger = Logger(subsystem: "local.semantic", category: "app")
+
+// visible in Console.app (subsystem local.semantic); also echoed to stderr for the command-line tools
 func log(_ s: String) {
+    logger.log("\(s, privacy: .public)")
     FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
 }

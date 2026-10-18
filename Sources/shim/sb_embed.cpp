@@ -19,7 +19,7 @@ struct sb_ctx {
 };
 
 static void quiet_log(enum ggml_log_level level, const char * text, void *) {
-    if (level >= GGML_LOG_LEVEL_ERROR && getenv("SEMBAR_DEBUG")) fputs(text, stderr);
+    if (level >= GGML_LOG_LEVEL_ERROR && getenv("SEMANTIC_DEBUG")) fputs(text, stderr);
 }
 
 sb_ctx * sb_init(const char * model_path, const char * mmproj_path, int n_ctx, int use_gpu) {

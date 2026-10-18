@@ -160,7 +160,7 @@ enum AssistantHandoff {
             DispatchQueue.main.async {
                 guard let running, error == nil else { fallback("Could not open ChatGPT"); return }
                 guard AXIsProcessTrusted() else {
-                    fallback("Allow SemBar under Privacy & Security → \(controlPermissionName). If already enabled, remove and add the currently installed SemBar app, then retry.", settings: openControlSettings)
+                    fallback("Allow Semantic under Privacy & Security → \(controlPermissionName). If already enabled, remove and add the currently installed Semantic app, then retry.", settings: openControlSettings)
                     return
                 }
                 let ax = AXUIElementCreateApplication(running.processIdentifier)

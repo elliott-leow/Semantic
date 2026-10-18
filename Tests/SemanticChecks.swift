@@ -3,7 +3,7 @@ import Foundation
 
 enum SemanticChecks {
     // Default checks use normalized synthetic vectors and an in-memory store.
-    // Set SEMBAR_SEMANTIC_MODELS to a model directory to also run real embeddings.
+    // Set SEMANTIC_MODELS to a model directory to also run real embeddings.
     static func run(root: URL) -> [(String, Bool)] {
         var results: [(String, Bool)] = []
         func check(_ label: String, _ passed: Bool) { results.append((label, passed)) }
@@ -105,7 +105,7 @@ enum SemanticChecks {
         let capped = Engine.similarRanks(in: cappedIndex, to: source, vector: q, kind: .image)
         check("Similar applies admission and duplicate collapse before its five-result cap", capped.count == 5 && capped.filter { cappedIndex.entries[$0.i].name.hasPrefix("good") }.count == 1 && capped.allSatisfy { !["weak.png", "unrelated.png", "source.png", "text-only.png"].contains(cappedIndex.entries[$0.i].name) })
 
-        if let modelDir = ProcessInfo.processInfo.environment["SEMBAR_SEMANTIC_MODELS"] {
+        if let modelDir = ProcessInfo.processInfo.environment["SEMANTIC_MODELS"] {
             results += modelChecks(modelDir: modelDir, root: root)
         }
         return results
@@ -115,7 +115,7 @@ enum SemanticChecks {
         var results: [(String, Bool)] = []
         func check(_ label: String, _ passed: Bool) { results.append((label, passed)) }
         // Links live only in SearchTests' isolated data directory. Never point
-        // SEMBAR_DATA_DIR at the user's support directory or open their index.
+        // SEMANTIC_DATA_DIR at the user's support directory or open their index.
         let fm = FileManager.default
         let models = URL(fileURLWithPath: Paths.support).appendingPathComponent("models")
         var links: [URL] = []

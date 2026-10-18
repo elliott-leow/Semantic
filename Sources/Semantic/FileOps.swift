@@ -383,7 +383,7 @@ enum FileOps {
         guard !srcs.isEmpty else { throw OpError("Attach a file to compress first") }
         try preflight(Op(id: "convert.zip", title: "Compress", symbol: ""), srcs)
         let fm = FileManager.default
-        let staging = fm.temporaryDirectory.appendingPathComponent("SemBar-archive-" + UUID().uuidString)
+        let staging = fm.temporaryDirectory.appendingPathComponent("Semantic-archive-" + UUID().uuidString)
         try fm.createDirectory(at: staging, withIntermediateDirectories: false)
         defer { try? fm.removeItem(at: staging) }
         let contents = staging.appendingPathComponent("contents")

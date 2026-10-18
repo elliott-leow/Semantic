@@ -1,4 +1,4 @@
-# SemBar
+# Semantic
 
 A natural-language Spotlight replacement for macOS. Press **⌘Y**, describe what you want.
 
@@ -11,7 +11,7 @@ so "screenshot with bar receipt" matches on the pixels and the OCR text of a scr
     ./build.sh
 
 Builds llama.cpp (static, Metal), downloads the models (176 MB text + 555 MB vision/audio encoders)
-to `~/Library/Application Support/SemBar/models`, installs `~/Applications/SemBar.app` and launches it.
+to `~/Library/Application Support/Semantic/models`, installs `~/Applications/Semantic.app` and launches it.
 Needs Xcode command line tools and `cmake` (or `uv`, which fetches cmake on the fly).
 
 ## Keys
@@ -82,7 +82,7 @@ bar, it uses the strongest file candidates from the current search, at most five
 attach are kept separately from that search-result limit. Search itself stays local; files are handed
 to ChatGPT only when you invoke the action.
 
-SemBar prefers the installed ChatGPT app. With Accessibility access it opens a new draft, inserts the
+Semantic prefers the installed ChatGPT app. With Accessibility access it opens a new draft, inserts the
 question, pastes actual files and checks for their attachment cards. It leaves sending to you.
 On macOS 27 this permission is named **Device Control and Data Access**, under **Privacy & Security**.
 **Use extracted text instead** is an explicit excerpt alternative (up to 4,000 characters per file,
@@ -134,7 +134,7 @@ Finder copy/paste, or drag and drop.
 - **Habits**: picks and app switches (apps kept in front for 3 s or more) build a local model of what you open,
   at what hour, and after which app. It drives the empty-bar suggestions and a bounded boost for typed searches.
   Everything decays with a three-week half-life, so a changed routine overtakes an old one. Stored in the `habits`
-  table of the index; `SemBar --suggest` prints what the empty bar would offer now.
+  table of the index; `Semantic --suggest` prints what the empty bar would offer now.
 - **Duplicates**: same-folder download-copy names of the same size collapse into one row (`+3 copies`).
   Numbered chapters and files in different folders remain distinct.
 
@@ -161,14 +161,14 @@ Anything that can be computed is answered in the first row; Return copies it (`a
 | Dates | `days until christmas`, `days since jan 1 2026`, `in 3 weeks`, `today + 45 days`, `what day is july 4 2027` |
 | World time | `time in tokyo`, `london time` |
 
-`SemBar --calc "expr" ...` prints calculator answers from the command line.
+`Semantic --calc "expr" ...` prints calculator answers from the command line.
 
 ## How it works
 
-- **Bar process** (`SemBar`): AppKit panel, no dock icon. Loads only the 176 MB text tower, and only
+- **Bar process** (`Semantic`): AppKit panel, no dock icon. Loads only the 176 MB text tower, and only
   while you are using it; it is freed after 5 minutes hidden. Queries combine filename/path matching and SQLite full-text search with a
   local embedding and a scan of an int8 matrix.
-- **Indexer** (`SemBar --index`): a short-lived child process. It is the only thing that ever loads the
+- **Indexer** (`Semantic --index`): a short-lived child process. It is the only thing that ever loads the
   vision and audio encoders, and it exits when done. It runs at launch, hourly, and when files change;
   if nothing changed it exits without loading a model.
 - **Signals per file**: name + extracted text (PDF, Office, plain text), the image itself, OCR of the
@@ -180,7 +180,7 @@ Anything that can be computed is answered in the first row; Return copies it (`a
 
 ## Config
 
-Optional `~/.config/sembar/config.json`:
+Optional `~/.config/semantic/config.json`:
 
     {
       "roots": ["~/Documents", "~/Screenshots"],
@@ -198,29 +198,29 @@ outputs. Repository filenames are indexed; expensive content extraction remains 
 
 ## Debugging
 
-    SemBar --query-latency asprin                    # first asynchronous callback timing
-    SemBar --query "ifp syllabus" "coffee near me"   # print ranked rows and intent scores
-    SemBar --query "/path/a.png|turn into jpg"       # what a request about an attached file resolves to
-    SemBar --do "/path/a.png|turn into jpg"          # run it
-    SemBar --llm "remind me to call mum at 5"        # raw command-model output
-    SemBar --similar /path/photo.jpg                 # query by example
-    SemBar --index --full                            # rebuild the index from scratch
+    Semantic --query-latency asprin                    # first asynchronous callback timing
+    Semantic --query "ifp syllabus" "coffee near me"   # print ranked rows and intent scores
+    Semantic --query "/path/a.png|turn into jpg"       # what a request about an attached file resolves to
+    Semantic --do "/path/a.png|turn into jpg"          # run it
+    Semantic --llm "remind me to call mum at 5"        # raw command-model output
+    Semantic --similar /path/photo.jpg                 # query by example
+    Semantic --index --full                            # rebuild the index from scratch
 
 ## Development checks
 
 `./build.sh --test` runs isolated search, indexing and interaction regression checks using temporary
 fixtures. `./build.sh --build-only` builds without installing; `--no-run` installs without launching.
-`build/SemBar.app/Contents/MacOS/SemBar --lexical --query asprin` checks name/content search without
+`build/Semantic.app/Contents/MacOS/Semantic --lexical --query asprin` checks name/content search without
 loading the model; omit `--lexical` for the full local model. These command-line checks do not prove
 cross-app dragging, Accessibility permissions or successful server-side attachment upload.
 
 For optional synthetic text/image relevance checks with the installed model, run the built test binary:
 
-    SEMBAR_SEMANTIC_MODELS="$HOME/Library/Application Support/SemBar/models" build/SearchTests.app/Contents/MacOS/SemBar
+    SEMANTIC_MODELS="$HOME/Library/Application Support/Semantic/models" build/SearchTests.app/Contents/MacOS/Semantic
 
 These use generic filenames, unrelated queries, and an isolated temporary index. They verify a small
 fixture set; they do not establish general search accuracy.
 
 The hybrid search and preview design draws on [FSearch](https://github.com/noahdunnagan/fsearch) and
-[DigUp](https://github.com/ARahim3/DigUp). This implementation uses SemBar's native SQLite and Swift
+[DigUp](https://github.com/ARahim3/DigUp). This implementation uses Semantic's native SQLite and Swift
 index; it does not embed FSearch's Rust daemon or claim its whole-disk benchmark results.

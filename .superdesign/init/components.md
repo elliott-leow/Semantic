@@ -1,5 +1,5 @@
 # Native AppKit components
-Sources/SemBar/Panel.swift: RowView, ChipView, DropView, BarEditor, Toast. No web framework.
+Sources/Semantic/Panel.swift: RowView, ChipView, DropView, BarEditor, Toast. No web framework.
 ```swift
 import AppKit
 import QuickLookThumbnailing

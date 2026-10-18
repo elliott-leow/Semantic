@@ -3,7 +3,7 @@ import Foundation
 import SQLite3
 import CryptoKit
 
-// Runs as a short-lived child process (`SemBar --index`) so the vision/audio encoders
+// Runs as a short-lived child process (`Semantic --index`) so the vision/audio encoders
 // are only resident while indexing, never in the bar itself.
 enum Indexer {
     static let modelTag = "embeddinggemma-2/Q4/512/v2"
