@@ -47,13 +47,13 @@ enum Commands {
                 }
             }
             guard let d = options.min() else { return nil }
-            return (d, (m[1] + m[5]).replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces))
+            return (d, Rx.replace(m[1] + m[5], "\\s+", " ").trimmingCharacters(in: .whitespaces))
         }
         d = nextDetectedTime(d, matched: String(text[r]))
         var rest = text
         rest.removeSubrange(r)
-        rest = rest.replacingOccurrences(of: "\\s+(at|on|by|for|this|next)\\s*$", with: "", options: .regularExpression)
-        return (d, rest.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces))
+        rest = Rx.replace(rest, "\\s+(at|on|by|for|this|next)\\s*$", "")
+        return (d, Rx.replace(rest, "\\s+", " ").trimmingCharacters(in: .whitespaces))
     }
 
     static func tidy(_ s: String) -> String {
@@ -75,11 +75,11 @@ enum Commands {
     // MARK: reminder
 
     static func reminder(_ text: String, _ j: [String: Any]? = nil) -> Hit {
-        var body = text.replacingOccurrences(of: "^(please )?(remind me|set a reminder|add a reminder|reminder|remember|todo|to-do)( to| that| about| for|:)?\\s+",
-                                             with: "", options: [.regularExpression, .caseInsensitive])
+        var body = Rx.replace(text, "^(please )?(remind me|set a reminder|add a reminder|reminder|remember|todo|to-do)( to| that| about| for|:)?\\s+",
+                              "", .caseInsensitive)
         var due: Date?
         if let (d, rest) = when(body) { due = d; body = rest } else if let w = grounded(j, "when", in: text), let (d, _) = when(w) { due = d }
-        body = body.replacingOccurrences(of: "^to\\s+", with: "", options: .regularExpression)
+        body = Rx.replace(body, "^to\\s+", "")
         let title = tidy(grounded(j, "title", in: text) ?? body)
         let sub = (due.map { whenFmt.string(from: $0) } ?? "No due date") + " · Reminders"
         return Hit(title: "Remind me: \(title)", subtitle: sub, icon: .symbol("checklist"), tag: "Reminder", key: "intent:reminder") { _ in
@@ -105,8 +105,8 @@ enum Commands {
     // MARK: event
 
     static func event(_ text: String, _ j: [String: Any]? = nil) -> Hit {
-        var body = text.replacingOccurrences(of: "^(please )?(schedule|add|create|new|put|book|set up)( an?| a new)?( calendar)?( event| meeting| appointment)?( for| called|:)?\\s+",
-                                             with: "", options: [.regularExpression, .caseInsensitive])
+        var body = Rx.replace(text, "^(please )?(schedule|add|create|new|put|book|set up)( an?| a new)?( calendar)?( event| meeting| appointment)?( for| called|:)?\\s+",
+                              "", .caseInsensitive)
         var start: Date?
         if let (d, rest) = when(body) { start = d; body = rest } else if let w = grounded(j, "when", in: text), let (d, _) = when(w) { start = d }
         var location = grounded(j, "location", in: text).map(tidy)

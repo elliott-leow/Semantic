@@ -32,7 +32,8 @@ final class Habits {
         c.w * pow(0.5, max(0, now - c.t) / half)
     }
 
-    static func hour(_ t: Double) -> Int { Calendar.current.component(.hour, from: Date(timeIntervalSince1970: t)) }
+    private static let calendar = Calendar.autoupdatingCurrent
+    static func hour(_ t: Double) -> Int { calendar.component(.hour, from: Date(timeIntervalSince1970: t)) }
 
     // learned picks never belong in the habit model when they are not something to reopen
     static func habitual(_ key: String) -> Bool { !key.hasPrefix("intent:") && !key.hasPrefix("op:") }

@@ -50,6 +50,8 @@ struct Filters {
         "spreadsheets": ["xlsx", "xls", "csv", "numbers"], "word doc": ["docx", "doc"], "word docs": ["docx", "doc"],
         "word document": ["docx", "doc"], "word documents": ["docx", "doc"],
     ]
+    private static let extOrder = extWords.sorted(by: { $0.key.count > $1.key.count })
+
     static let kindWords: [String: Kind] = [
         "image": .image, "images": .image, "picture": .image, "pictures": .image, "photo": .image, "photos": .image, "pics": .image,
         "screenshot": .image, "screenshots": .image, "video": .video, "videos": .video, "movie": .video, "movies": .video,
@@ -70,7 +72,7 @@ struct Filters {
         func day(_ offset: Int) -> Double { (cal.date(byAdding: .day, value: offset, to: today) ?? today).timeIntervalSince1970 }
 
         func take(_ pattern: String) -> [String]? {
-            guard let re = try? NSRegularExpression(pattern: pattern), let m = re.firstMatch(in: q, range: NSRange(q.startIndex..., in: q)),
+            guard let m = Rx.first(q, pattern),
                   let r = Range(m.range, in: q) else { return nil }
             let groups = (0..<m.numberOfRanges).map { i in Range(m.range(at: i), in: q).map { String(q[$0]) } ?? "" }
             q.replaceSubrange(r, with: " ")
@@ -127,8 +129,8 @@ struct Filters {
         }
 
         // "in downloads", "from the homework folder": only when such a folder exists
-        if let re = try? NSRegularExpression(pattern: "\\s(?:in|from|inside|under)\\s+(?:my\\s+|the\\s+)?([a-z0-9][a-z0-9 _.-]*?)(?:\\s+folder)?\\s*$"),
-           let m = re.firstMatch(in: q, range: NSRange(q.startIndex..., in: q)), let r = Range(m.range, in: q), let g = Range(m.range(at: 1), in: q) {
+        if let m = Rx.first(q, "\\s(?:in|from|inside|under)\\s+(?:my\\s+|the\\s+)?([a-z0-9][a-z0-9 _.-]*?)(?:\\s+folder)?\\s*$"),
+           let r = Range(m.range, in: q), let g = Range(m.range(at: 1), in: q) {
             let name = String(q[g]).trimmingCharacters(in: .whitespaces)
             if folderExists(name) {
                 f.folder = name
@@ -138,15 +140,16 @@ struct Filters {
         }
 
         // file types named outright are hard filters
-        for (word, exts) in extWords.sorted(by: { $0.key.count > $1.key.count }) {
-            if take("(?<! to)(?<! into)(?<! as)(?<! to a)(?<! into a)(?<! as a)\\s\(word)(?:\\s+files?)?\\s") != nil {
+        for (word, exts) in extOrder {
+            // the pattern needs the word itself; most queries name no file type
+            if Engine.bytesContain(q, word), take("(?<! to)(?<! into)(?<! as)(?<! to a)(?<! into a)(?<! as a)\\s\(word)(?:\\s+files?)?\\s") != nil {
                 f.exts = (f.exts ?? []).union(exts)
                 f.notes.append(exts[0].uppercased())
                 q = " " + q + " "
             }
         }
 
-        var rest = q.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+        var rest = Rx.replace(q, "\\s+", " ").trimmingCharacters(in: .whitespaces)
         // kind words only nudge ranking ("lecture notes" must still find PDFs), unless they are all that is left
         let words = rest.split(separator: " ").map(String.init)
         let kindHits = words.compactMap { kindWords[$0] }

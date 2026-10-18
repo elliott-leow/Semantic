@@ -3,7 +3,8 @@ import AppKit
 import Foundation
 import SQLite3
 
-struct Entry {
+// Constants only; a class so hot loops read fields in place instead of copying a dozen references.
+final class Entry {
     let path: String      // file path, or URL / opaque key for non-file kinds
     let name: String
     let lname: String
@@ -12,6 +13,7 @@ struct Entry {
     let stemCount: Int    // all stem tokens
     let ascii: Bool       // lname is ASCII, so substring tests can compare bytes
     let pathTokens: [String]
+    let pathAscii: Bool   // so are the path tokens
     let lpath: String
     let tokens: [String]
     let initials: String
@@ -21,6 +23,14 @@ struct Entry {
     let ext: String
     let snippet: String   // kept only for kinds that are shown or acted on by their text
     let dupKey: String    // equal for copies of the same file
+
+    init(path: String, name: String, lname: String, stem: String, words: [String], stemCount: Int, ascii: Bool, pathTokens: [String],
+         pathAscii: Bool, lpath: String, tokens: [String], initials: String, kind: Kind, mtime: Double, size: Int, ext: String,
+         snippet: String, dupKey: String) {
+        self.path = path; self.name = name; self.lname = lname; self.stem = stem; self.words = words; self.stemCount = stemCount
+        self.ascii = ascii; self.pathTokens = pathTokens; self.pathAscii = pathAscii; self.lpath = lpath; self.tokens = tokens
+        self.initials = initials; self.kind = kind; self.mtime = mtime; self.size = size; self.ext = ext; self.snippet = snippet; self.dupKey = dupKey
+    }
 }
 
 // Snapshot of the index: entries plus one int8 matrix of vectors. Only the engine queue appends rows.
@@ -59,6 +69,7 @@ final class Index {
 
     func loadMetadata(_ store: Store) {
         var ids: [Int64: Int] = [:], parents = Set<String>()
+        var folderTokens: [String: (String, [String], Bool)] = [:]  // files in one folder share its tokens
         store.run("SELECT id,path,name,kind,mtime,size,snippet FROM files ORDER BY id") { [self] st in
             let name = colText(st, 2), path = colText(st, 1)
             let kind = Kind(rawValue: Int(sqlite3_column_int(st, 3))) ?? .other
@@ -69,10 +80,19 @@ final class Index {
             var stem = (lname as NSString).deletingPathExtension
             stem.makeContiguousUTF8()
             let stemToks = nameTokens(stem)
-            let base = (name as NSString).deletingPathExtension.lowercased()
-                .replacingOccurrences(of: "(\\s*\\(\\d+\\)|\\s+copy(\\s+\\d+)?)+$", with: "", options: .regularExpression)
+            var base = (name as NSString).deletingPathExtension.lowercased()
+            // a match ends in ")" or holds "copy"; most names have neither
+            if base.utf8.contains(0x29) || Engine.bytesContain(base, "copy") {
+                base = Rx.replace(base, "(\\s*\\(\\d+\\)|\\s+copy(\\s+\\d+)?)+$", "")
+            }
             // Do not collapse numbered chapters or unrelated same-size files in other folders.
             let parent = (path as NSString).deletingLastPathComponent
+            // String keys compare canonically; reuse only for the very same bytes
+            let (ptoks, pascii) = folderTokens[parent].flatMap { $0.0.utf8.elementsEqual(parent.utf8) ? ($0.1, $0.2) : nil } ?? {
+                let t = nameTokens(parent), ascii = t.allSatisfy { $0.utf8.allSatisfy { $0 < 0x80 } }
+                folderTokens[parent] = (parent, t, ascii)
+                return (t, ascii)
+            }()
             let dup = kind.isFile && kind != .folder && kind != .app && size > 0 ? "\(parent)/\(base).\(ext)#\(size)" : path
             ids[sqlite3_column_int64(st, 0)] = entries.count
             byPath[path] = entries.count
@@ -85,7 +105,7 @@ final class Index {
                 }
             }
             entries.append(Entry(path: path, name: name, lname: lname, stem: stem, words: stemToks.filter { !stopwords.contains($0) },
-                                 stemCount: stemToks.count, ascii: lname.utf8.allSatisfy { $0 < 0x80 }, pathTokens: nameTokens(parent), lpath: lpath, tokens: toks,
+                                 stemCount: stemToks.count, ascii: lname.utf8.allSatisfy { $0 < 0x80 }, pathTokens: ptoks, pathAscii: pascii, lpath: lpath, tokens: toks,
                                  initials: String(toks.compactMap(\.first)), kind: kind,
                                  mtime: sqlite3_column_double(st, 4), size: size, ext: ext,
                                  snippet: kind.isFile ? "" : colText(st, 6), dupKey: dup))
@@ -368,7 +388,7 @@ final class Engine {
     // MARK: learning from picks
 
     static func norm(_ q: String) -> String {
-        q.lowercased().trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        Rx.replace(q.lowercased().trimmingCharacters(in: .whitespaces), "\\s+", " ")
     }
 
     // a chosen result, typed for or suggested; Habits keeps both the query and the routine
@@ -417,7 +437,7 @@ final class Engine {
     // Documents are what people name this way, so they win ties against project files with a similar name.
     func bestFiles(_ phrase: String, strong: Bool = false, count: Int = 1) -> [String] {
         locked {
-            let q = phrase.lowercased().replacingOccurrences(of: "^(the|my|a|an|this|that) ", with: "", options: .regularExpression)
+            let q = Rx.replace(phrase.lowercased(), "^(the|my|a|an|this|that) ", "")
             let ok: Set<Kind> = [.doc, .image, .audio, .video, .other]
             var r = rank(rest: q, filters: Filters(), gate: 3.4, boosts: [:]).filter { ok.contains(index.entries[$0.i].kind) }.prefix(25).map { x -> Ranked in
                 var x = x
@@ -544,8 +564,10 @@ final class Engine {
                 return $0.element.path < $1.element.path
             }.map { Ranked(i: $0.offset, score: 1, lex: 1, loc: 0, src: 0) }
         } else {
+            // every entry's name match is needed then; the full pass reuses them
+            let lexes = filters.isEmpty && !query.contentOnly ? Self.lexes(LexQuery.ranking(rest), ix) : nil
             ranked = rank(rest: rest, filters: filters, gate: 3.4, boosts: boosts(Self.norm(query.explicit ? query.text : text)),
-                          contentOnly: query.contentOnly, snapshot: ix, semantic: false, stale: stale)
+                          contentOnly: query.contentOnly, snapshot: ix, semantic: false, lexes: lexes, stale: stale)
         }
         if stale?() == true { return nil }
         var seen = Set<String>()
@@ -570,7 +592,7 @@ final class Engine {
     // What lex needs from a query, worked out once rather than for every entry.
     struct LexQuery: Equatable {
         let q: String, qt: [String], qtLong: [Bool], expanded: String, suffix: String
-        let slash: Bool, len: Int, ascii: Bool
+        let slash: Bool, len: Int, ascii: Bool, qtAscii: Bool, prefixAscii: Bool
 
         init(_ q: String, _ qt: [String]) {
             self.q = q
@@ -581,6 +603,9 @@ final class Engine {
             slash = q.contains("/")
             len = q.count
             ascii = q.utf8.allSatisfy { $0 < 0x80 }
+            qtAscii = qt.allSatisfy { $0.utf8.allSatisfy { $0 < 0x80 } }
+            // a trailing CR could be half of a CR LF character, which bytes cannot tell
+            prefixAscii = ascii && !q.utf8.contains(13)
         }
 
         // rank's reading: stopwords are dropped unless nothing else is left
@@ -601,13 +626,16 @@ final class Engine {
         if e.lpath == x.expanded || (x.slash && e.lpath.hasSuffix(x.suffix)) { return 1 }
         // "chrome" names Google Chrome as surely as a file named chrome.tsx
         if e.kind == .app, !qt.isEmpty, qt.allSatisfy({ e.tokens.contains($0) }) { return 0.95 }
-        if e.lname.hasPrefix(q) { return 0.9 }
+        // ASCII on both sides (nearly always) compares bytes; otherwise characters
+        let ascii = x.prefixAscii && e.ascii
+        if ascii ? Self.bytesPrefix(e.lname, q) : e.lname.hasPrefix(q) { return 0.9 }
         var best: Float = 0
         if !qt.isEmpty {
             var names = 0, paths = 0
+            let tokAscii = x.qtAscii && e.ascii, pathAscii = x.qtAscii && e.pathAscii
             for t in qt {
-                if e.tokens.contains(where: { $0.hasPrefix(t) }) { names += 1; paths += 1 }
-                else if e.pathTokens.contains(where: { $0.hasPrefix(t) }) { paths += 1 }
+                if tokAscii ? e.tokens.contains(where: { Self.bytesPrefix($0, t) }) : e.tokens.contains(where: { $0.hasPrefix(t) }) { names += 1; paths += 1 }
+                else if pathAscii ? e.pathTokens.contains(where: { Self.bytesPrefix($0, t) }) : e.pathTokens.contains(where: { $0.hasPrefix(t) }) { paths += 1 }
             }
             if names == qt.count { best = 0.8 }
             else if paths == qt.count { best = 0.7 }
@@ -615,18 +643,27 @@ final class Engine {
         }
         if x.len >= 3, x.ascii && e.ascii ? Self.bytesContain(e.lname, q) : e.lname.contains(q) { best = max(best, 0.65) }
         if x.slash, e.lpath.contains(x.expanded) { best = max(best, 0.7) }
-        if e.kind == .app, x.len >= 2, e.initials.hasPrefix(q) { best = max(best, 0.7) }
+        if e.kind == .app, x.len >= 2, ascii ? Self.bytesPrefix(e.initials, q) : e.initials.hasPrefix(q) { best = max(best, 0.7) }
         if best < 0.5, !qt.isEmpty, qt.count <= 4 {
             var all = true
             for (n, term) in qt.enumerated() where !e.tokens.contains(where: { token in
-                token.hasPrefix(term) || (x.qtLong[n] && Self.oneEdit(term, token))
+                (x.qtAscii && e.ascii ? Self.bytesPrefix(token, term) : token.hasPrefix(term)) || (x.qtLong[n] && Self.oneEdit(term, token))
             }) { all = false; break }
             if all { best = (qt.count == e.tokens.count || qt.count == e.stemCount) ? 0.62 : 0.56 }
         }
         return best
     }
 
-    private static func bytesContain(_ s: String, _ t: String) -> Bool {
+    // for ASCII strings, the same answer as hasPrefix
+    @inline(__always)
+    private static func bytesPrefix(_ s: String, _ t: String) -> Bool {
+        var s = s, t = t
+        return s.withUTF8 { a in t.withUTF8 { b in
+            a.count >= b.count && (b.isEmpty || memcmp(a.baseAddress!, b.baseAddress!, b.count) == 0)
+        } }
+    }
+
+    static func bytesContain(_ s: String, _ t: String) -> Bool {
         var s = s, t = t
         return s.withUTF8 { a in t.withUTF8 { b in
             b.isEmpty || (a.count >= b.count && memmem(a.baseAddress!, a.count, b.baseAddress!, b.count) != nil)
@@ -759,8 +796,24 @@ final class Engine {
     #endif
 
     // every entry's name match for a query, in entry order
+    // The file-search pass and the full pass ask for the same ones; entries are immutable, so the
+    // same array (held here, so its storage cannot be reused) and the same query give the same values.
+    private static let lexMemoLock = NSLock()
+    private static var lexMemo: (entries: [Entry], query: LexQuery, lexes: [Float])?
+
     private static func lexes(_ x: LexQuery, _ ix: Index) -> [Float] {
-        ix.entries.withUnsafeBufferPointer { es in es.map { lex(x, $0) } }
+        let entries = ix.entries
+        func same(_ a: [Entry]) -> Bool {
+            a.count == entries.count && a.withUnsafeBufferPointer { p in entries.withUnsafeBufferPointer { $0.baseAddress == p.baseAddress } }
+        }
+        lexMemoLock.lock()
+        if let m = lexMemo, m.query == x, same(m.entries) { lexMemoLock.unlock(); return m.lexes }
+        lexMemoLock.unlock()
+        let out = entries.withUnsafeBufferPointer { es in es.map { lex(x, $0) } }
+        lexMemoLock.lock()
+        lexMemo = (entries, x, out)
+        lexMemoLock.unlock()
+        return out
     }
 
     // every entry worth showing for a query, best first; empty once `stale` says nobody is waiting for it
@@ -881,17 +934,18 @@ final class Engine {
                                   src: words?.src ?? (r >= 0 ? Int(ix.rowSrc[r]) : 0), learned: learned, match: words, why: why))
             }
         }
+        let entries = ix.entries
         out.sort {
             if $0.score != $1.score { return $0.score > $1.score }
-            let a = ix.entries[$0.i], b = ix.entries[$1.i]
+            let a = entries[$0.i], b = entries[$1.i]
             if a.mtime != b.mtime { return a.mtime > b.mtime }
             return a.path < b.path
         }
         if !listing {
             // relevance decides what is worth showing; learning only orders it, so it never hides runners-up
-            let topFile = out.filter { ix.entries[$0.i].kind.isFile }.map { $0.score - $0.learned }.max() ?? 0
-            let topOther = out.filter { !ix.entries[$0.i].kind.isFile }.map { $0.score - $0.learned }.max() ?? 0
-            out.removeAll { $0.score - $0.learned < (ix.entries[$0.i].kind.isFile ? topFile : topOther) * 0.42 }
+            let topFile = out.filter { entries[$0.i].kind.isFile }.map { $0.score - $0.learned }.max() ?? 0
+            let topOther = out.filter { !entries[$0.i].kind.isFile }.map { $0.score - $0.learned }.max() ?? 0
+            out.removeAll { $0.score - $0.learned < (entries[$0.i].kind.isFile ? topFile : topOther) * 0.42 }
         }
         return out
     }

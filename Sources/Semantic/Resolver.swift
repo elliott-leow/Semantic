@@ -99,12 +99,12 @@ enum Resolver {
 
     private static func cut(_ text: String, _ range: NSRange, replacement: String) -> (String, String) {
         let ns = text as NSString
-        func tidy(_ s: String) -> String { s.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces) }
+        func tidy(_ s: String) -> String { Rx.replace(s, "\\s+", " ").trimmingCharacters(in: .whitespaces) }
         return (tidy(ns.replacingCharacters(in: range, with: " ")), tidy(ns.replacingCharacters(in: range, with: " " + replacement + " ")))
     }
 
     private static func find(_ text: String, _ pattern: String) -> NSTextCheckingResult? {
-        (try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]))?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text))
+        Rx.first(text, pattern, [.caseInsensitive])
     }
 
     private static func group(_ m: NSTextCheckingResult, _ i: Int, _ text: String) -> String {

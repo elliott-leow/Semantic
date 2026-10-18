@@ -22,21 +22,20 @@ enum Calc {
 
     static func answer(_ raw: String) -> CalcResult? {
         var q = raw.lowercased().trimmingCharacters(in: .whitespaces)
-        q = q.replacingOccurrences(of: "^(what is|what's|whats|calculate|calc|compute|how much is|convert|=)\\s+", with: "", options: .regularExpression)
-        q = q.replacingOccurrences(of: "[?=\\s]+$", with: "", options: .regularExpression)
+        q = sub(q, "^(what is|what's|whats|calculate|calc|compute|how much is|convert|=)\\s+", "")
+        q = sub(q, "[?=\\s]+$", "")
         guard !q.isEmpty else { return nil }
         return worldTime(q) ?? dateMath(q) ?? baseConvert(q) ?? convert(q) ?? arithmetic(q)
     }
 
     // capture groups of a whole-string match
     static func rx(_ s: String, _ pattern: String) -> [String]? {
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
-              let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) else { return nil }
+        guard let m = Rx.first(s, pattern, [.caseInsensitive]) else { return nil }
         return (0..<m.numberOfRanges).map { i in Range(m.range(at: i), in: s).map { String(s[$0]) } ?? "" }
     }
 
     static func sub(_ s: String, _ pattern: String, _ with: String) -> String {
-        s.replacingOccurrences(of: pattern, with: with, options: .regularExpression)
+        Rx.replace(s, pattern, with)
     }
 
     // MARK: formatting
@@ -458,7 +457,7 @@ enum Calc {
 
     static func unit(_ s: String) -> Unit? {
         var k = s.lowercased().replacingOccurrences(of: " ", with: "").replacingOccurrences(of: ".", with: "")
-        k = k.replacingOccurrences(of: "^(degrees?|deg)(?=[cf]|celsius|fahrenheit)", with: "", options: .regularExpression)
+        k = sub(k, "^(degrees?|deg)(?=[cf]|celsius|fahrenheit)", "")
         if let u = units[k] { return u }
         if k.hasSuffix("s"), k.count > 2, let u = units[String(k.dropLast())] { return u }
         return nil
@@ -485,7 +484,7 @@ enum Calc {
         var left = "", right = ""
         if let m = rx(q, "^how many\\s+(.+?)\\s+(?:are\\s+|is\\s+)?(?:there\\s+)?in\\s+(.+)$") {
             (left, right) = (m[2], m[1])
-        } else if let re = try? NSRegularExpression(pattern: "(?<=\\s)(to|in|into|as)(?=\\s)"),
+        } else if let re = Rx.get("(?<=\\s)(to|in|into|as)(?=\\s)"),
                   let m = re.matches(in: q, range: NSRange(q.startIndex..., in: q)).last, let r = Range(m.range, in: q) {
             (left, right) = (String(q[..<r.lowerBound]), String(q[r.upperBound...]))
         } else { return nil }
@@ -499,7 +498,7 @@ enum Calc {
             } else if to.dim != "temp" {
                 // compound: 5 ft 3 in, 1 h 30 min
                 var sum = 0.0, covered = 0
-                let re = try! NSRegularExpression(pattern: "([0-9.]+)\\s*([a-z'\"]+)")
+                let re = Rx.get("([0-9.]+)\\s*([a-z'\"]+)")!
                 for m in re.matches(in: left, range: NSRange(left.startIndex..., in: left)) {
                     guard let a = Range(m.range(at: 1), in: left), let b = Range(m.range(at: 2), in: left),
                           let v = Double(left[a]), let u = unit(String(left[b])), u.dim == to.dim else { return nil }
@@ -579,7 +578,7 @@ enum Calc {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         var s = text.trimmingCharacters(in: .whitespaces)
-        s = s.replacingOccurrences(of: "^(the|my) ", with: "", options: .regularExpression)
+        s = sub(s, "^(the|my) ", "")
         switch s {
         case "today", "now": return today
         case "tomorrow": return cal.date(byAdding: .day, value: 1, to: today)

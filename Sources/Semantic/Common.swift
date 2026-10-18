@@ -134,7 +134,48 @@ let stopwords: Set<String> = ["a", "an", "the", "of", "in", "on", "at", "to", "f
                               "from", "that", "this", "is", "it", "open", "show", "find", "file", "about"]
 
 func nameTokens(_ s: String) -> [String] {
-    s.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init)
+    // ASCII (nearly every name): letters and digits are exactly A-Z, a-z, 0-9
+    if s.utf8.allSatisfy({ $0 < 0x80 }) {
+        var out: [String] = [], tok: [UInt8] = []
+        for var c in s.utf8 {
+            if c &- 65 < 26 { c |= 0x20 } else if !(c &- 97 < 26 || c &- 48 < 10) {
+                if !tok.isEmpty { out.append(String(decoding: tok, as: UTF8.self)); tok.removeAll(keepingCapacity: true) }
+                continue
+            }
+            tok.append(c)
+        }
+        if !tok.isEmpty { out.append(String(decoding: tok, as: UTF8.self)) }
+        return out
+    }
+    return s.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init)
+}
+
+// Patterns compiled once. NSRegularExpression is safe to share between threads.
+enum Rx {
+    private struct Key: Hashable { let pattern: String; let options: UInt }
+    private static var cache: [Key: NSRegularExpression?] = [:]
+    private static let lock = NSLock()
+
+    static func get(_ pattern: String, _ options: NSRegularExpression.Options = []) -> NSRegularExpression? {
+        let key = Key(pattern: pattern, options: options.rawValue)
+        lock.lock()
+        defer { lock.unlock() }
+        if let re = cache[key] { return re }
+        let re = try? NSRegularExpression(pattern: pattern, options: options)
+        if cache.count >= 1024 { cache.removeAll() }
+        cache[key] = re
+        return re
+    }
+
+    // what `replacingOccurrences(of:with:options: .regularExpression)` does, same template syntax
+    static func replace(_ s: String, _ pattern: String, _ template: String, _ options: NSRegularExpression.Options = []) -> String {
+        guard let re = get(pattern, options) else { return s }
+        return re.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: template)
+    }
+
+    static func first(_ s: String, _ pattern: String, _ options: NSRegularExpression.Options = []) -> NSTextCheckingResult? {
+        get(pattern, options)?.firstMatch(in: s, range: NSRange(s.startIndex..., in: s))
+    }
 }
 
 let logger = Logger(subsystem: "local.semantic", category: "app")

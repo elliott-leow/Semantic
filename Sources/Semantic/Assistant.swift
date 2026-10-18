@@ -65,7 +65,7 @@ enum Assistant {
     }
 
     static func clean(_ text: String) -> String {
-        text.replacingOccurrences(of: "^(ask )?(chat ?gpt|gpt|claude|gemini)[,:]?\\s*(to |about )?", with: "", options: [.regularExpression, .caseInsensitive])
+        Rx.replace(text, "^(ask )?(chat ?gpt|gpt|claude|gemini)[,:]?\\s*(to |about )?", "", .caseInsensitive)
             .trimmingCharacters(in: .whitespaces)
     }
 
