@@ -310,6 +310,10 @@ enum SearchTests {
         for (label, passed) in SemanticChecks.run(root: root) { check(passed, label) }
         for (label, passed) in FunctionalityChecks.run(root: root) { check(passed, label) }
         for (label, passed) in PreviewChecks.run(root: root) { check(passed, label) }
+        for (label, passed) in SearchPerfChecks.run(root: root) { check(passed, label) }
+        for (label, passed) in IndexerChecks.run(root: root) { check(passed, label) }
+        for (label, passed) in PanelChecks.run(root: root) { check(passed, label) }
+        for (label, passed) in AppChecks.run(root: root) { check(passed, label) }
         for (label, passed) in HabitChecks.run(root: root) { check(passed, label) }
         print("\(checks - failures)/\(checks) checks passed")
         fflush(stdout)
