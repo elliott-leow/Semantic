@@ -22,7 +22,7 @@ enum Sources {
         let fm = FileManager.default
         guard fm.fileExists(atPath: dbPath) else { return nil }
         // a stable name: String.hashValue is seeded per process, which left a copy behind on every crash
-        let copy = Paths.tmp + "/src-" + SHA256.hash(data: Data(dbPath.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined() + ".sqlite"
+        let copy = Paths.tmp + "/src-" + Extract.hex(SHA256.hash(data: Data(dbPath.utf8)).prefix(8)) + ".sqlite"
         for suffix in ["", "-wal"] {
             try? fm.removeItem(atPath: copy + suffix)
             try? fm.copyItem(atPath: dbPath + suffix, toPath: copy + suffix)

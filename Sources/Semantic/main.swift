@@ -44,7 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.bar.refresh()
         }
         Rates.onUpdate = { Engine.shared.onChange?() }
-        Engine.shared.reloadIndex()
+        reloadIndex()
         // a configured shortcut that cannot be had falls back to ⌘Y rather than leaving no way in
         if !registerHotKey(), Hotkey.configured != .fallback { registerHotKey(.fallback) }
         MenuBar.apply()
@@ -88,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func toggle() {
         if bar.isVisible { bar.hide(); return }
         unloadTimer?.invalidate()
+        reloadIfDirty()
         Engine.shared.warm()
         bar.show()
     }

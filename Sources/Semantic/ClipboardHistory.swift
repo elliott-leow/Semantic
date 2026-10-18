@@ -22,12 +22,14 @@ enum ClipboardHistory {
             store.run("SELECT id FROM files WHERE kind = ? AND mtime < ?", [Kind.clip.rawValue, now.timeIntervalSince1970 - days * 86400]) { old.append(sqlite3_column_int64($0, 0)) }
         }
         for id in Set(old) { store.deleteFile(id) }
+        if !old.isEmpty { store.bumpGeneration() }
     }
 
     static func clear(_ store: Store) -> Int {
         var ids: [Int64] = []
         store.run("SELECT id FROM files WHERE kind = ?", [Kind.clip.rawValue]) { ids.append(sqlite3_column_int64($0, 0)) }
         for id in ids { store.deleteFile(id) }
+        if !ids.isEmpty { store.bumpGeneration() }
         return ids.count
     }
 
@@ -54,5 +56,6 @@ enum ClipboardHistory {
         store.run("INSERT INTO files(path,name,kind,mtime,size,state,snippet) VALUES(?,?,?,?,?,2,?)",
                   [key, name, Kind.clip.rawValue, now.timeIntervalSince1970, s.count, s])
         prune(store, now: now)
+        store.bumpGeneration()
     }
 }
