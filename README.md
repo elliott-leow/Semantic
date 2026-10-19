@@ -6,27 +6,45 @@ It runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma
 llama.cpp. Files, images, audio, video, apps and commands all live in one 512-d embedding space,
 so "screenshot with bar receipt" matches on the pixels and the OCR text of a screenshot, not its filename.
 
-## Build
+## Install
+
+Needs an Apple Silicon Mac on macOS 14 or later and about 3 GB of free space. Paste this into Terminal:
+
+    curl -fsSL https://raw.githubusercontent.com/elliott-leow/Semantic/main/install.sh | bash
+
+Then press **⌘Y**. That's it. The first install takes about 10–15 minutes (a 1.5 GB model download plus compiling);
+if Apple's Command Line Tools are missing, a macOS dialog asks to install them (click **Install**) and
+the installer continues by itself afterwards. Nothing else needs to be installed first.
+
+- **Update**: run the same command again. It keeps the models and the compiled engine, so it takes about 3 minutes.
+- **Uninstall**: `curl -fsSL https://raw.githubusercontent.com/elliott-leow/Semantic/main/install.sh | bash -s -- --uninstall`
+  removes the app, models, index and settings, after asking.
+
+On first launch Semantic shows its **Permissions** window once (all optional; each says what it adds), adds a
+menu bar item, and registers itself as a login item (once; turning it off in System Settings or Semantic
+Settings sticks). An interrupted install can be rerun; downloads resume where they stopped.
+
+### Building from a checkout
 
     ./build.sh
 
-Builds llama.cpp (static, Metal), downloads the models (176 MB text + 555 MB vision/audio encoders)
+Builds llama.cpp (static, Metal), downloads the models (176 MB text, 555 MB vision/audio, 730 MB command model)
 to `~/Library/Application Support/Semantic/models`, installs `~/Applications/Semantic.app` and launches it.
-Needs Xcode command line tools and `cmake` (or `uv`, which fetches cmake on the fly).
+It finds cmake on the PATH, through `uvx`, or fetches a private copy; build output goes to logs, shown on failure.
 
 | Option | Effect |
 | --- | --- |
 | `--no-run` | build and install, don't launch |
 | `--build-only` | build into `$BUILD` only |
 | `--test` | build and run the regression checks |
+| `--uninstall` | remove the app, models, index and settings (`--uninstall --yes` skips the question) |
 | `BUILD=dir` | build output directory (default `./build`), so several builds can run side by side |
-| `SIGN_IDENTITY=…` | code-signing identity; default is the first valid "Apple Development" identity, else ad-hoc |
+| `SIGN_IDENTITY=…` | code-signing identity; default is the first valid "Apple Development" identity, else a self-signed "Semantic Local Signing" identity created in the login keychain |
 
 A stable signing identity keeps privacy permissions (Accessibility, Screen Recording, Full Disk Access)
-across rebuilds; an ad-hoc signature changes every build and macOS drops them.
-
-On first launch Semantic shows its **Permissions** window once, adds a menu bar item, and registers itself
-as a login item (once; turning it off in System Settings or Semantic Settings sticks).
+across rebuilds; an ad-hoc signature changes every build and macOS drops them. The self-signed identity
+exists only for that; it is trusted by nothing. The first time it is used macOS may ask whether
+`codesign` may use it: choose **Always Allow**.
 
 ## Keys
 
