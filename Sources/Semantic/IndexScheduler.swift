@@ -10,7 +10,25 @@ private enum Watch {
     static var store: Store?          // one read-only connection for progress polling
     static let maxDirs = 400          // beyond this a full walk is cheaper than listing each folder
     static var generation: String??   // meta "generation" as of the last reload; nil before one
-    static var dirty = false          // a reload while indexing was skipped because the bar was hidden
+    static var dirty = false          // a reload was skipped because the bar was hidden
+    static var packages: [String: Bool] = [:] // folder -> is a package, for the file watcher
+
+    // The outermost package that `path` lies strictly inside, if any. Only names with an extension are
+    // looked at: that is how packages are recognised, and it keeps the check to a few cached lookups.
+    static func package(containing path: String) -> String? {
+        guard let base = roots.filter({ path.hasPrefix($0 + "/") }).max(by: { $0.count < $1.count }) else { return nil }
+        var p = base
+        for comp in path.dropFirst(base.count + 1).split(separator: "/").dropLast() {
+            p += "/" + comp
+            guard comp.contains(".") else { continue }
+            if let known = packages[p] { if known { return p } else { continue } }
+            guard let isPackage = Indexer.isPackage(p) else { continue } // gone: its parent's event covers it
+            if packages.count > 10_000 { packages.removeAll() }
+            packages[p] = isPackage
+            if isPackage { return p }
+        }
+        return nil
+    }
 }
 
 // When the indexer child process runs, and how the bar learns about its progress.
@@ -46,7 +64,7 @@ extension AppDelegate {
                 self.progressTimer?.invalidate()
                 self.bar.status = ""
                 // a run cut short may have written rows without bumping the generation
-                self.reloadIndex(ifChanged: p.terminationReason == .exit && p.terminationStatus == 0)
+                self.reloadIndex(ifChanged: p.terminationReason == .exit && p.terminationStatus == 0, deferIfHidden: true)
                 if self.pendingIndex { self.pendingIndex = false; self.startIndexer() }
                 else if Watch.rescan || !Watch.dirs.isEmpty { self.scheduleChangedRun() }
             }
@@ -66,10 +84,13 @@ extension AppDelegate {
 
     // The indexer and the clipboard history write meta "generation" after changing rows, so an unchanged
     // value means the loaded index is current. It is read before reloading: a later write changes it again.
-    func reloadIndex(ifChanged: Bool = false) {
+    // `deferIfHidden`: loading every row and vector is the costliest thing the idle bar does, so a hidden
+    // bar only marks the index stale and reloads it when it is next shown.
+    func reloadIndex(ifChanged: Bool = false, deferIfHidden: Bool = false) {
         if Watch.store == nil { Watch.store = Store(readonly: true) }
         let gen = Watch.store.map { $0.metaString("generation") }
         if ifChanged, let gen, let last = Watch.generation, gen == last { Watch.dirty = false; return }
+        if deferIfHidden, !bar.isVisible { Watch.dirty = true; return }
         Watch.generation = gen
         Watch.dirty = false
         Engine.shared.reloadIndex()
@@ -119,6 +140,12 @@ extension AppDelegate {
                 // a file event names the item; its folder is what gets listed again
                 guard !Indexer.ignorable(p, roots: Watch.roots) else { continue }
                 let dir = (p as NSString).deletingLastPathComponent
+                if let pkg = Watch.package(containing: p) {
+                    // a package is indexed as one file, and only its direct entries change its date; churn deeper
+                    // inside (a Photos library's databases, an app's caches) would otherwise start a run every minute
+                    if dir == pkg { dirs.append((pkg as NSString).deletingLastPathComponent) }
+                    continue
+                }
                 dirs.append(Watch.roots.contains(p) ? p : dir)
             }
             AppDelegate.shared?.filesChanged(dirs, rescan: rescan)

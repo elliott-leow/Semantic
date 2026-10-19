@@ -66,6 +66,10 @@ enum IndexerChecks {
             check("the watcher ignores hidden and dependency folders", Indexer.ignorable(walkDir.path + "/.git/index", roots: [walkDir.path]) &&
                   Indexer.ignorable(walkDir.path + "/node_modules/x/y.js", roots: [walkDir.path]) && !Indexer.ignorable(walkDir.path + "/sub/a.txt", roots: [walkDir.path]) &&
                   Indexer.ignorable("/elsewhere/a.txt", roots: [walkDir.path]))
+            try write("walk/Tool.app/Contents/Resources/r.txt", "fixture")
+            check("folders inside a package are never scanned",
+                  Indexer.start(walkDir.path + "/Tool.app/Contents/Resources", roots: [walkDir.path]) == nil &&
+                  Indexer.start(walkDir.path + "/Tool.app", roots: [walkDir.path]) == nil)
 
             // attempts and backoff
             guard let mem = Store(path: ":memory:") else { check("attempt fixture database opens", false); return results }

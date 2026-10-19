@@ -82,7 +82,9 @@ enum Indexer {
         var p = base
         for comp in dir.dropFirst(base.count + 1).split(separator: "/") {
             p += "/" + comp
-            if skipFolder(p, name: String(comp), rules: rules) || s.ignores.contains(where: { $0.matches(p) }) { return nil }
+            // a package (an app, a document bundle, a Photos library) is one file: its inside is never walked
+            if skipFolder(p, name: String(comp), rules: rules) || s.ignores.contains(where: { $0.matches(p) }) ||
+                (comp.contains(".") && isPackage(p) == true) { return nil }
             if s.repo == nil, FileManager.default.fileExists(atPath: p + "/.git") { s.repo = p }
             if let i = IndexRules.ignoreFile(in: p) { s.ignores.append(i) }
         }
@@ -95,6 +97,11 @@ enum Indexer {
         if path == Paths.support || path.hasPrefix(Paths.support + "/") || IndexRules.shared.excluded(path) { return true }
         guard let base = roots.filter({ path == $0 || path.hasPrefix($0 + "/") }).max(by: { $0.count < $1.count }) else { return true }
         return path.dropFirst(base.count).split(separator: "/").contains { $0.hasPrefix(".") || skipDirs.contains(String($0)) || $0.hasSuffix(".egg-info") }
+    }
+
+    // nil when `path` cannot be read (gone already)
+    static func isPackage(_ path: String) -> Bool? {
+        (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.isPackageKey]))?.isPackage
     }
 
     // `recursive: false` lists only the entries directly inside `root` (an incremental rescan)

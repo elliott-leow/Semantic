@@ -122,7 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // always polled, so turning history on in Settings works without a relaunch
     private func watchClipboard() {
         let t = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in self?.pollClipboard() }
-        t.tolerance = 0.5
+        t.tolerance = 1 // lets macOS fold the wake-up into others
         // rows past `clipboardDays` age out even when nothing new is copied
         let prune = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in ioQueue.async { Store().map { ClipboardHistory.prune($0) } } }
         prune.tolerance = 300
@@ -316,6 +316,9 @@ if let i = args.firstIndex(of: "--selftest"), i + 1 < args.count {
     app.run()
 }
 
+// llama.cpp's Metal residency sets keep a thread waking every 5 ms for as long as the process lives once a
+// model has loaded. The bar idles far more than it searches, so it does without them; the indexer keeps them.
+setenv("GGML_METAL_NO_RESIDENCY", "1", 1)
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
