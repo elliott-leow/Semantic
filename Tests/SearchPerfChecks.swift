@@ -71,13 +71,20 @@ enum SearchPerfChecks {
         for raw in queries {
             let lq = raw.lowercased()
             for qt in [nameTokens(lq), nameTokens(lq).filter { !stopwords.contains($0) }] {
-                for e in ix.entries where Engine.lexForChecks(lq, qt, e) != oldLex(lq, qt, e) {
-                    print("  lex differs for “\(raw)” \(qt) on \(e.name): \(Engine.lexForChecks(lq, qt, e)) vs \(oldLex(lq, qt, e))")
-                    lexSame = false
+                for e in ix.entries {
+                    let actual = Engine.lexForChecks(lq, qt, e), old = oldLex(lq, qt, e)
+                    // Complete name tokens now receive a protected ranking; numeric typos no longer match.
+                    let complete = !qt.isEmpty && qt.contains(where: { e.tokens.contains($0) }) &&
+                        qt.allSatisfy { e.tokens.contains($0) || e.pathTokens.contains($0) }
+                    let numeric = qt.contains { $0.contains(where: { $0.isNumber }) }
+                    if actual != old && !(complete && actual == 0.95) && !(numeric && actual < old) {
+                        print("  unexpected lex difference for “\(raw)” \(qt) on \(e.name): \(actual) vs \(old)")
+                        lexSame = false
+                    }
                 }
             }
         }
-        check("precomputed name matching scores every entry as before", lexSame)
+        check("precomputed name matching preserves prior scores except intentional token changes", lexSame)
         for (a, b) in [("chapter", "chaptr"), ("chapetr", "chapter"), ("résumé", "resume"), ("résumé", "résume"), ("abcd", "abdc"), ("abcd", "abcde"),
                        ("abcd", "xbcd"), ("abcd", "abxy"), ("写真です", "写真でした"), ("éabc", "eabc")] {
             if Engine.oneEdit(a, b) != oldOneEdit(a, b) || Engine.oneEdit(b, a) != oldOneEdit(b, a) { lexSame = false; print("  oneEdit differs: \(a) \(b)") }

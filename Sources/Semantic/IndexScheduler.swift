@@ -78,7 +78,9 @@ extension AppDelegate {
             self.bar.status = "Indexing \(s)"
             self.ticks += 1
             // surface new results while indexing; a hidden bar catches up when it is shown
-            if self.ticks == 1 || self.ticks % 8 == 0 { if self.bar.isVisible { self.reloadIndex() } else { Watch.dirty = true } }
+            if self.ticks == 1 || self.ticks % 8 == 0 {
+                self.reloadIndex(ifChanged: true, deferIfHidden: true)
+            }
         }
     }
 

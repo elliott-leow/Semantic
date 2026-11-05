@@ -100,6 +100,39 @@ enum SearchTests {
             check(first?.hits.first?.title == expected, "quick literal filename remains consistent: " + query)
         }
         check(literalEngine.build("ext:pdf PDF Guide").hits.filter { $0.path != nil }.isEmpty, "explicit filters retain precedence over literal names")
+        // Exact tokens anywhere in a filename must survive more than five incidental body hits.
+        let discoveryDB = Store(path: ":memory:")!
+        func discoveryAdd(_ path: String, content: String? = nil) {
+            discoveryDB.run("INSERT INTO files(path,name,kind,mtime,size,state,snippet) VALUES(?,?,?,?,?,3,'')",
+                            [path, (path as NSString).lastPathComponent, Kind.doc.rawValue, 100, 100])
+            if let content { discoveryDB.addContent(discoveryDB.lastID, content) }
+        }
+        let versionPath = "/fixtures/Desktop/cognitive_distortion_sycophancy_presentation_v16.pptx"
+        discoveryAdd(versionPath)
+        discoveryAdd("/fixtures/Desktop/v160.pptx", content: "The v16 identifier appears here.")
+        discoveryAdd("/fixtures/Desktop/v16notes.pptx")
+        discoveryAdd("/fixtures/Desktop/presentation_v17.pptx")
+        discoveryAdd("/fixtures/Desktop/presentation_v1702.pptx")
+        for n in 0..<7 { discoveryAdd("/fixtures/Other/body\(n).txt", content: "The v16 identifier appears here.") }
+        let desktopPath = "/fixtures/Desktop"
+        discoveryDB.run("INSERT INTO files(path,name,kind,mtime,size,state,snippet) VALUES(?,'Desktop',?,0,0,4,'')", [desktopPath, Kind.folder.rawValue])
+        for n in 0..<7 { discoveryAdd("/fixtures/Other/desktop_shot_\(n).png", content: "Desktop appears in the content too.") }
+        let discoveryIndex = Index.load(store: discoveryDB)
+        let discoveryEngine = Engine(index: discoveryIndex)
+        for (query, expectedPath) in [("v16", versionPath), ("Desktop v16", versionPath), ("Desktop", desktopPath)] {
+            let results = discoveryEngine.build(query).hits.filter { $0.path != nil }
+            check(results.first?.path == expectedPath && results.count <= 5, "filename token wins content and version prefixes: " + query)
+            var preliminary: SearchResult?
+            discoveryEngine.search(query) { if preliminary == nil { preliminary = $0 } }
+            let deadline = Date().addingTimeInterval(2)
+            while preliminary == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.01)) }
+            check(preliminary?.hits.first { $0.path != nil }?.path == expectedPath, "preliminary filename token wins content and version prefixes: " + query)
+        }
+        let grepPaths = discoveryEngine.build("grep:v16").hits.compactMap(\.path)
+        check(!grepPaths.isEmpty && !grepPaths.contains(versionPath) && grepPaths.contains("/fixtures/Desktop/v160.pptx"),
+              "explicit grep still requires matching content")
+        let numericEntry = discoveryIndex.entries.first { $0.name == "presentation_v1702.pptx" }!
+        check(Engine.lexForChecks("v1701", ["v1701"], numericEntry) < 0.5, "numeric identifiers are not typo matched")
         let chapters = ix.entries.filter { $0.name.hasPrefix("chapter") }.map(\.dupKey)
         check(Set(chapters).count == 2, "numbered documents are not collapsed as duplicates")
         check(ix.entries.filter { $0.name == "report.pdf" }.map(\.dupKey).count == Set(ix.entries.filter { $0.name == "report.pdf" }.map(\.dupKey)).count, "same-name files in different folders remain distinct")

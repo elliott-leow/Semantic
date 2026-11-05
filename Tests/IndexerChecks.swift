@@ -60,6 +60,13 @@ enum IndexerChecks {
             check("an incremental listing stays one level deep", shallow.contains("sub") && shallow.contains("a.txt") && !shallow.contains("sub/keep.txt"))
             let subOnly = Set(Indexer.walk(walkDir.path + "/sub", rules: rules).map { String($0.path.dropFirst(walkDir.path.count + 1)) })
             check("a walk below the root inherits ignore rules from above", subOnly.contains("sub/keep.txt") && !subOnly.contains("sub/skip.txt") && !subOnly.contains("sub/n.md"))
+            let rootRows = Indexer.walk(walkDir.path, recursive: false, roots: [walkDir.path], rules: rules)
+            check("a watched root is searchable without content or model work",
+                  rootRows.contains { $0.path == walkDir.path && $0.kind == .folder && !$0.semantic })
+            let emptyRoot = dir.appendingPathComponent("empty-root")
+            try fm.createDirectory(at: emptyRoot, withIntermediateDirectories: true)
+            let emptyRows = Indexer.walk(emptyRoot.path, roots: [emptyRoot.path])
+            check("an empty watched folder is still discoverable", emptyRows.count == 1 && emptyRows.first?.path == emptyRoot.path && emptyRows.first?.semantic == false)
             check("folders inside skipped or ignored folders are never scanned",
                   Indexer.start(walkDir.path + "/node_modules", roots: [walkDir.path]) == nil && Indexer.start(walkDir.path + "/secret", roots: [walkDir.path]) == nil &&
                   Indexer.start(walkDir.path + "/sub", roots: [walkDir.path]) != nil)
@@ -227,6 +234,37 @@ enum IndexerChecks {
                 return r
             }
             func has(_ term: String) -> Bool { !(Store(readonly: true)?.contentMatches(term).isEmpty ?? true) }
+            var rootState = -1, rootVectors = -1
+            Store(readonly: true)?.run("SELECT state,(SELECT count(*) FROM vecs WHERE file_id=files.id) FROM files WHERE path=?", [root.path]) {
+                rootState = Int(sqlite3_column_int($0, 0)); rootVectors = Int(sqlite3_column_int($0, 1))
+            }
+            check("the configured root persists as metadata only", rootState == 4 && rootVectors == 0)
+            let rootID = fileRow(root.path)?.id
+            let rootGeneration = Store(readonly: true)?.metaString("generation")
+            _ = Indexer.run(full: false, namesOnly: true, paths: [root.path])
+            check("an unchanged root rescan keeps its row and generation", rootID != nil && fileRow(root.path)?.id == rootID && Store(readonly: true)?.metaString("generation") == rootGeneration)
+            // Enable a source with a recent read marker, without reading the user's browser.
+            // Its row must survive a folder event, then disappear when the source is disabled.
+            let sourceStore = Store()!
+            sourceStore.run("INSERT INTO files(path,name,kind,mtime,size,state,snippet) VALUES('https://example.com/retained','Retained source',?,0,0,1,'')", [Kind.web.rawValue])
+            sourceStore.setMeta("source.web.read", string: String(Date().timeIntervalSince1970))
+            sourceStore.setMeta("source.web.sig", string: "on")
+            let savedSources = config.sources
+            config.sources = ["web"]
+            _ = Indexer.run(full: false, namesOnly: true, paths: [root.path])
+            config.sources = savedSources
+            check("a folder event preserves source rows that are not due", fileRow("https://example.com/retained") != nil)
+            _ = Indexer.run(full: false, namesOnly: true, paths: [root.path])
+            check("disabling a source still removes its rows during a folder update", fileRow("https://example.com/retained") == nil)
+            let copied = root.appendingPathComponent("copied_deck_v16.pptx")
+            try Data("transferred deck metadata fixture".utf8).write(to: copied)
+            _ = Indexer.run(full: false, namesOnly: true, paths: [root.path])
+            let metadata = Index.load(vectors: false)
+            check("a copied file is findable before extraction or embeddings", fileRow(copied.path)?.text == 0 &&
+                  Engine(index: metadata).build("v16").hits.first { $0.path != nil }?.path == copied.path &&
+                  Store(readonly: true)?.metaString("generation") != rootGeneration)
+            try fm.removeItem(at: copied)
+            _ = Indexer.run(full: false, namesOnly: true, paths: [root.path])
             let a = inc.appendingPathComponent("a.txt").path
             let firstID = fileRow(a)?.id
             check("a full run indexes the fixture", firstID != nil && fileRow(a)?.text == 1 && has("QQ-1111") && has("KK-5555"))

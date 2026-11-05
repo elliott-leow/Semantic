@@ -120,7 +120,10 @@ enum Indexer {
         func spelled(_ u: URL) -> String { u.path.hasPrefix(resolved + "/") ? root + u.path.dropFirst(resolved.count) : u.path }
         guard let en = fm.enumerator(at: URL(fileURLWithPath: root), includingPropertiesForKeys: keys,
                                      options: [.skipsHiddenFiles, .skipsPackageDescendants], errorHandler: { url, _ in onError?(spelled(url)); return true }) else { onError?(root); return [] }
-        var out: [Cand] = []
+        // Enumeration visits children only. Roots (including empty ones) need a searchable
+        // folder row too. Metadata is enough; no extraction or embedding is scheduled.
+        var out: [Cand] = roots.contains(root) ? [Cand(path: root, name: URL(fileURLWithPath: root).lastPathComponent,
+                                                     kind: .folder, mtime: 0, size: 0, semantic: false)] : []
         var repo = st.repo
         var ignores = st.ignores
         let homeDepth = Paths.home.split(separator: "/").count
@@ -401,14 +404,13 @@ enum Indexer {
                                           kind: Int(sqlite3_column_int(st, 4)), revision: colText(st, 5), hash: colText(st, 6))
             }
         }
-        // A file-change run only looks up or deletes rows under the folders it lists, and non-file rows (replaced
-        // whenever their source is read). A byte range ('0' sorts right after '/') matches Swift's string
-        // comparison only for ASCII folders, so any other spelling loads everything.
-        if incremental, listed.allSatisfy({ $0.utf8.allSatisfy { $0 < 0x80 } }) {
+        // Read only the affected file rows. Source rows are loaded below only if their source is
+        // actually read. Non-ASCII paths keep the full lookup for Swift's canonical comparison.
+        let scoped = incremental && listed.allSatisfy { $0.utf8.allSatisfy { $0 < 0x80 } }
+        if scoped {
             for d in listed where !listed.contains(where: { $0 != d && d.hasPrefix($0 + "/") }) {
-                loadOld(" WHERE path >= ? AND path < ?", [d + "/", d + "0"])
+                loadOld(" WHERE path = ? OR (path >= ? AND path < ?)", [d, d + "/", d + "0"])
             }
-            loadOld(" WHERE kind > ?", [Kind.folder.rawValue])
         } else {
             loadOld()
         }
@@ -444,6 +446,10 @@ enum Indexer {
             readSources.append((name, sig))
             cands += items.map { Cand(path: $0.key, name: $0.name, kind: $0.kind, mtime: $0.mtime, size: 0, body: $0.body) }
         }
+        if scoped, !readSources.isEmpty {
+            // One filtered read even if several sources are due; files has no kind index.
+            loadOld(" WHERE kind > ? AND kind NOT IN (\(keepKinds.sorted().map(String.init).joined(separator: ",")))", [Kind.folder.rawValue])
+        }
 
         var seen = Set<String>()
         cands = cands.filter { seen.insert($0.path).inserted }.sorted { $0.mtime > $1.mtime }
@@ -456,6 +462,7 @@ enum Indexer {
         func authoritative(_ p: String, _ o: Old) -> Bool {
             if keepKinds.contains(o.kind) || isBlind(p) { return false }
             guard incremental, Kind(rawValue: o.kind)?.isFile ?? true else { return true }
+            if rootList.contains(p), scanned.contains(p) { return true }
             return scanned.contains((p as NSString).deletingLastPathComponent) || inside(p, vanished)
         }
         store.exec("BEGIN")
@@ -496,6 +503,9 @@ enum Indexer {
         }
         progress.begin("names", total: cands.count)
         progress.tick(cands.count, label: "names ready · \(cands.count) items", force: true)
+        // Publish cheap names before extraction/model work. The bar can detect this generation
+        // without repeatedly reloading an unchanged index while the child is busy.
+        if wrote { store.bumpGeneration(); wrote = false }
         store.exec("COMMIT")
         log("indexing\(incremental ? " \(scanned.count) changed folders" : ""): \(cands.count) items, \(todo.count) new or changed; names ready")
         if namesOnly { return 0 }

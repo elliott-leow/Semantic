@@ -6,6 +6,10 @@ It runs Google's [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma
 llama.cpp. Files, images, audio, video, apps and commands all live in one 512-d embedding space,
 so "screenshot with bar receipt" matches on the pixels and the OCR text of a screenshot, not its filename.
 
+Names work before content analysis finishes: `v16` finds a filename containing that version token,
+`Desktop` finds the folder itself, and `Desktop v16` combines the folder and filename. File changes
+are batched into scans of the affected folders; unchanged progress does not reload the index.
+
 ## Install
 
 Needs an Apple Silicon Mac on macOS 14 or later and about 3 GB of free space. Paste this into Terminal:

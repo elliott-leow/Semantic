@@ -497,9 +497,7 @@ final class Engine {
         }
     }
 
-    private static let roots = Indexer.roots().map { $0 + "/" }
-
-    // Files outside the indexed folders, by name, delivered as a follow-up when the index found few.
+    // Fill name-search gaps, including a new file inside a watched root whose scan is still queued.
     private func addSpotlight(_ text: String, to r: SearchResult, generation gen: Int, done: @escaping (SearchResult) -> Void) {
         let ix = index, have = Set(r.hits.compactMap(\.path))
         let room = SearchResult.fileLimit - have.count
@@ -507,7 +505,7 @@ final class Engine {
         spotQueue.async {
             guard self.isCurrent(gen) else { return }
             let paths = Spotlight.names(text, limit: room) { p in
-                have.contains(p) || ix.byPath[p] != nil || Self.roots.contains { p.hasPrefix($0) }
+                have.contains(p) || ix.byPath[p] != nil
             }
             guard !paths.isEmpty else { return }
             self.queue.async {
@@ -567,7 +565,7 @@ final class Engine {
             // every entry's name match is needed then; the full pass reuses them
             let lexes = filters.isEmpty && !query.contentOnly ? Self.lexes(LexQuery.ranking(rest), ix) : nil
             ranked = rank(rest: rest, filters: filters, gate: 3.4, boosts: boosts(Self.norm(query.explicit ? query.text : text)),
-                          contentOnly: query.contentOnly, snapshot: ix, semantic: false, lexes: lexes, stale: stale)
+                          nameOnly: literalName && !query.explicit, contentOnly: query.contentOnly, snapshot: ix, semantic: false, lexes: lexes, stale: stale)
         }
         if stale?() == true { return nil }
         var seen = Set<String>()
@@ -592,12 +590,14 @@ final class Engine {
     // What lex needs from a query, worked out once rather than for every entry.
     struct LexQuery: Equatable {
         let q: String, qt: [String], qtLong: [Bool], expanded: String, suffix: String
-        let slash: Bool, len: Int, ascii: Bool, qtAscii: Bool, prefixAscii: Bool
+        let slash: Bool, len: Int, ascii: Bool, qtAscii: Bool, prefixAscii: Bool, tokenPriority: Bool
 
         init(_ q: String, _ qt: [String]) {
             self.q = q
             self.qt = qt
-            qtLong = qt.map { $0.count >= 4 }
+            // Numeric identifiers need exact digits, not typo correction; decide once per query.
+            qtLong = qt.map { $0.count >= 4 && !$0.contains(where: { $0.isNumber }) }
+            tokenPriority = qt.count == 1 || qt.contains { $0.contains(where: { $0.isNumber }) }
             expanded = (q as NSString).expandingTildeInPath.lowercased()
             suffix = "/" + q
             slash = q.contains("/")
@@ -621,7 +621,7 @@ final class Engine {
         if e.lname == q || e.stem == q { return 1 }
         if !qt.isEmpty, !x.slash {
             if e.words == qt { return 1 }
-            if e.words.starts(with: qt) { return 0.9 }
+            if e.words.starts(with: qt) { return x.tokenPriority ? 0.95 : 0.9 }
         }
         if e.lpath == x.expanded || (x.slash && e.lpath.hasSuffix(x.suffix)) { return 1 }
         // "chrome" names Google Chrome as surely as a file named chrome.tsx
@@ -631,15 +631,47 @@ final class Engine {
         if ascii ? Self.bytesPrefix(e.lname, q) : e.lname.hasPrefix(q) { return 0.9 }
         var best: Float = 0
         if !qt.isEmpty {
-            var names = 0, paths = 0
-            let tokAscii = x.qtAscii && e.ascii, pathAscii = x.qtAscii && e.pathAscii
-            for t in qt {
-                if tokAscii ? e.tokens.contains(where: { Self.bytesPrefix($0, t) }) : e.tokens.contains(where: { $0.hasPrefix(t) }) { names += 1; paths += 1 }
-                else if pathAscii ? e.pathTokens.contains(where: { Self.bytesPrefix($0, t) }) : e.pathTokens.contains(where: { $0.hasPrefix(t) }) { paths += 1 }
+            if !x.tokenPriority {
+                // Ordinary descriptions keep the cheaper prefix pass and their existing weighting.
+                var names = 0, paths = 0
+                let tokAscii = x.qtAscii && e.ascii, pathAscii = x.qtAscii && e.pathAscii
+                for t in qt {
+                    if tokAscii ? e.tokens.contains(where: { Self.bytesPrefix($0, t) }) : e.tokens.contains(where: { $0.hasPrefix(t) }) { names += 1; paths += 1 }
+                    else if pathAscii ? e.pathTokens.contains(where: { Self.bytesPrefix($0, t) }) : e.pathTokens.contains(where: { $0.hasPrefix(t) }) { paths += 1 }
+                }
+                if names == qt.count { return 0.8 }
+                if paths == qt.count { best = 0.7 }
+                else { best = 0.25 * Float(names) / Float(qt.count) }
+            } else {
+                var names = 0, paths = 0, exactNames = 0, exactPaths = 0
+                let tokAscii = x.qtAscii && e.ascii, pathAscii = x.qtAscii && e.pathAscii
+                for t in qt {
+                    var namePrefix = false, nameExact = false
+                    for token in e.tokens {
+                        if tokAscii ? Self.bytesPrefix(token, t) : token.hasPrefix(t) {
+                            namePrefix = true
+                            if tokAscii ? token.utf8.count == t.utf8.count : token == t { nameExact = true; break }
+                        }
+                    }
+                    if nameExact { names += 1; paths += 1; exactNames += 1; exactPaths += 1 }
+                    else {
+                        if namePrefix { names += 1; paths += 1; continue }
+                        var pathPrefix = false, pathExact = false
+                        for token in e.pathTokens {
+                            if pathAscii ? Self.bytesPrefix(token, t) : token.hasPrefix(t) {
+                                pathPrefix = true
+                                if pathAscii ? token.utf8.count == t.utf8.count : token == t { pathExact = true; break }
+                            }
+                        }
+                        if pathExact { exactPaths += 1 }
+                        if pathExact || pathPrefix { paths += 1 }
+                    }
+                }
+                if exactNames > 0 && exactPaths == qt.count { return 0.95 }
+                else if names == qt.count { return 0.8 }
+                else if paths == qt.count { best = 0.7 }
+                else { best = 0.25 * Float(names) / Float(qt.count) }
             }
-            if names == qt.count { best = 0.8 }
-            else if paths == qt.count { best = 0.7 }
-            else { best = 0.25 * Float(names) / Float(qt.count) }
         }
         if x.len >= 3, x.ascii && e.ascii ? Self.bytesContain(e.lname, q) : e.lname.contains(q) { best = max(best, 0.65) }
         if x.slash, e.lpath.contains(x.expanded) { best = max(best, 0.7) }
@@ -647,7 +679,7 @@ final class Engine {
         if best < 0.5, !qt.isEmpty, qt.count <= 4 {
             var all = true
             for (n, term) in qt.enumerated() where !e.tokens.contains(where: { token in
-                (x.qtAscii && e.ascii ? Self.bytesPrefix(token, term) : token.hasPrefix(term)) || (x.qtLong[n] && Self.oneEdit(term, token))
+                (x.qtAscii && e.ascii ? Self.bytesPrefix(token, term) : token.hasPrefix(term)) || (x.qtLong[n] && Self.oneEdit(term, token, ascii: x.qtAscii && e.ascii) && !token.contains(where: { $0.isNumber }))
             }) { all = false; break }
             if all { best = (qt.count == e.tokens.count || qt.count == e.stemCount) ? 0.62 : 0.56 }
         }
@@ -675,11 +707,11 @@ final class Engine {
     #endif
 
     // One insertion, deletion, substitution or adjacent transposition; short words stay exact.
-    static func oneEdit(_ a: String, _ b: String) -> Bool {
+    static func oneEdit(_ a: String, _ b: String, ascii: Bool = false) -> Bool {
         let na = a.utf8.count, nb = b.utf8.count
         guard abs(na - nb) <= 4 else { return false }
         // ASCII (nearly every name) compares bytes in place; anything else compares characters
-        if a.utf8.allSatisfy({ $0 < 0x80 }), b.utf8.allSatisfy({ $0 < 0x80 }) {
+        if ascii || (a.utf8.allSatisfy({ $0 < 0x80 }) && b.utf8.allSatisfy({ $0 < 0x80 })) {
             guard abs(na - nb) <= 1 else { return false }
             var a = a, b = b
             return a.withUTF8 { x in b.withUTF8 { y in oneEdit(x, y) } }
@@ -820,6 +852,7 @@ final class Engine {
     private func rank(rest: String, filters: Filters, gate: Float, boosts: [String: Float], nameOnly: Bool = false, contentOnly: Bool = false,
                       snapshot: Index? = nil, semantic: Bool = true, habits: [String: Float]? = nil, queryVector: [Float]? = nil,
                       lexes: [Float]? = nil, stale: (() -> Bool)? = nil) -> [Ranked] {
+        if stale?() == true { return [] }
         let ix = snapshot ?? index
         let habit = habits ?? (learning ? Habits.shared.prior() : [:])
         // a file that was learned and then moved or renamed keeps what was learned under its name
@@ -908,8 +941,9 @@ final class Engine {
                     // Learned choices refine relevance; only a choice repeated for this exact query admits a result on its own.
                     guard l >= 0.5 || words != nil || (!nameOnly && !identifier && scanned && admitted[i]) || boost >= 7 else { continue }
                     if nameOnly, l < 0.9 { continue }
-                    // Exact names have a protected lead over merely inferred semantic matches.
-                    why.name = l == 1 ? 16 : (l >= 0.9 ? 10 : 6 * l + (l >= 0.5 && l < 0.65 ? 3 : 0))
+                    // Identifier tokens must also beat a prefix name that happens to contain the query.
+                    let exactIdentifier = identifier && !contentOnly
+                    why.name = l == 1 ? (exactIdentifier ? 26 : 16) : (l >= 0.95 ? (exactIdentifier ? 24 : 14) : (l >= 0.9 ? 10 : 6 * l + (l >= 0.5 && l < 0.65 ? 3 : 0)))
                     why.meaning = scanned ? (identifier ? 0.35 : semWeight) * min(6, sem[i]) : 0
                     why.words = words == nil ? 0 : (identifier ? 10 : 5)
                     s = why.name + why.meaning + why.words + min(9, boost)
@@ -943,9 +977,16 @@ final class Engine {
         }
         if !listing {
             // relevance decides what is worth showing; learning only orders it, so it never hides runners-up
-            let topFile = out.filter { entries[$0.i].kind.isFile }.map { $0.score - $0.learned }.max() ?? 0
-            let topOther = out.filter { !entries[$0.i].kind.isFile }.map { $0.score - $0.learned }.max() ?? 0
-            out.removeAll { $0.score - $0.learned < (entries[$0.i].kind.isFile ? topFile : topOther) * 0.42 }
+            func relevance(_ r: Ranked) -> Float {
+                // The identifier ordering bonus should not hide relevant runners-up.
+                r.score - r.learned - (identifier && !contentOnly && r.lex >= 0.95 ? 10 : 0)
+            }
+            var topFile: Float = 0, topOther: Float = 0
+            for r in out {
+                if entries[r.i].kind.isFile { topFile = max(topFile, relevance(r)) }
+                else { topOther = max(topOther, relevance(r)) }
+            }
+            out.removeAll { relevance($0) < (entries[$0.i].kind.isFile ? topFile : topOther) * 0.42 }
         }
         return out
     }
@@ -1127,8 +1168,10 @@ final class Engine {
                 return $0.element.path < $1.element.path
             }.map { Ranked(i: $0.offset, score: 1, lex: 1, loc: 0, src: 0) }
         } else {
+            // A plain exact name reached this branch through hasLiteralName. Keep it a cheap
+            // name lookup so content and meaning cannot displace the item the user named.
             ranked = rank(rest: query.text.lowercased(), filters: query.filters, gate: 3.4, boosts: boosts(Self.norm(query.text)),
-                          contentOnly: query.contentOnly, stale: stale).filter { query.matches(index.entries[$0.i]) }
+                          nameOnly: !query.explicit, contentOnly: query.contentOnly, stale: stale).filter { query.matches(index.entries[$0.i]) }
         }
         var seen = Set<String>()
         let top = ranked.filter { seen.insert(index.entries[$0.i].dupKey).inserted }.prefix(SearchResult.fileLimit)
@@ -1279,7 +1322,7 @@ final class Engine {
                     }.map { Ranked(i: $0, score: 1, lex: 1, loc: 0, src: 0) }
                 } else if query.explicit || Self.hasLiteralName(text, in: ix) {
                     ranked = self.rank(rest: query.text.lowercased(), filters: query.filters, gate: 3.4, boosts: self.boosts(Self.norm(query.text)),
-                                       contentOnly: query.contentOnly).filter { query.matches(ix.entries[$0.i]) }
+                                       nameOnly: !query.explicit, contentOnly: query.contentOnly).filter { query.matches(ix.entries[$0.i]) }
                 } else if Calc.answer(text) == nil {
                     let (filters, rest) = Filters.parse(text, folderExists: ix.hasFolder)
                     ranked = self.rank(rest: rest, filters: filters, gate: 3.4, boosts: self.boosts(Self.norm(text)))
