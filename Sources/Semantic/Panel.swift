@@ -405,7 +405,7 @@ final class BarController: NSObject, NSTextFieldDelegate, NSTableViewDataSource,
         }
         lastSession = nil
         // what is in front shapes what is likely wanted next, and is never itself suggested
-        Habits.shared.setContext(front?.bundleURL?.path)
+        Habits.shared.setContext(Sys.indexedAppPath(front?.bundleURL))
         resize()
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(field)

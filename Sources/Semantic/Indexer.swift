@@ -39,26 +39,40 @@ enum Indexer {
         }
     }
 
-    static func apps() -> [Cand] {
-        let fm = FileManager.default
-        var out: [Cand] = []
-        func add(_ p: String) {
-            let attrs = try? fm.attributesOfItem(atPath: p)
-            let m = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-            out.append(Cand(path: p, name: fm.displayName(atPath: p).replacingOccurrences(of: ".app", with: ""), kind: .app, mtime: m, size: 0))
-        }
+    // Where apps are found, and how many folder levels below each are looked into (Utilities, vendor folders).
+    // A var so the checks can point it at a fixture.
+    static var appFolders: [(dir: String, depth: Int)] = [("/Applications", 1), ("/System/Applications", 1),
+                                                          (Paths.home + "/Applications", 1), ("/System/Library/CoreServices/Applications", 0)]
+    static let finder = "/System/Library/CoreServices/Finder.app"
+
+    // The app bundles in the application folders: directory listings only, so the bar can afford it on every show.
+    static func appPaths() -> [String] {
+        var out: [String] = []
         func scan(_ dir: String, depth: Int) {
-            for n in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where !n.hasPrefix(".") {
+            for n in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where !n.hasPrefix(".") {
                 let p = dir + "/" + n
-                if n.hasSuffix(".app") { add(p) } else if depth > 0 { scan(p, depth: depth - 1) }
+                if n.hasSuffix(".app") { out.append(p) } else if depth > 0 { scan(p, depth: depth - 1) }
             }
         }
-        scan("/Applications", depth: 1)
-        scan("/System/Applications", depth: 1)
-        scan(Paths.home + "/Applications", depth: 1)
-        scan("/System/Library/CoreServices/Applications", depth: 0)
-        add("/System/Library/CoreServices/Finder.app")
-        return out
+        for f in appFolders { scan(f.dir, depth: f.depth) }
+        return out + [finder]
+    }
+
+    // an app bundle, or a folder of them, that appPaths() lists; not a file inside a bundle
+    static func appEntry(_ path: String) -> Bool {
+        appFolders.contains { f in
+            guard path.hasPrefix(f.dir + "/") else { return false }
+            let comps = path.dropFirst(f.dir.count + 1).split(separator: "/")
+            return comps.count <= f.depth + 1 && !comps.contains { $0.hasPrefix(".") } && !comps.dropLast().contains { $0.hasSuffix(".app") }
+        }
+    }
+
+    static func apps() -> [Cand] {
+        let fm = FileManager.default
+        return appPaths().map { p in
+            let m = ((try? fm.attributesOfItem(atPath: p))?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            return Cand(path: p, name: fm.displayName(atPath: p).replacingOccurrences(of: ".app", with: ""), kind: .app, mtime: m, size: 0)
+        }
     }
 
     // a folder whose contents are never indexed
@@ -406,11 +420,14 @@ enum Indexer {
         }
         // Read only the affected file rows. Source rows are loaded below only if their source is
         // actually read. Non-ASCII paths keep the full lookup for Swift's canonical comparison.
-        let scoped = incremental && listed.allSatisfy { $0.utf8.allSatisfy { $0 < 0x80 } }
+        let scoped = incremental && (listed + appFolders.map(\.dir)).allSatisfy { $0.utf8.allSatisfy { $0 < 0x80 } }
         if scoped {
             for d in listed where !listed.contains(where: { $0 != d && d.hasPrefix($0 + "/") }) {
                 loadOld(" WHERE path = ? OR (path >= ? AND path < ?)", [d, d + "/", d + "0"])
             }
+            // the app rows, which every run lists again below
+            for f in appFolders { loadOld(" WHERE path >= ? AND path < ?", [f.dir + "/", f.dir + "0"]) }
+            loadOld(" WHERE path = ?", [finder])
         } else {
             loadOld()
         }
@@ -420,6 +437,9 @@ enum Indexer {
         var blind: [String] = []
         // incremental: the folders listed this run; only their direct entries (and vanished subfolders) may be deleted
         var scanned = Set<String>()
+        // Every run lists the application folders, not just full walks: an app installed since the last walk
+        // is openable after the next run of any kind. Only this listing makes app rows, so it is their authority.
+        cands = apps()
         if incremental {
             for d in pathSet where listed.contains(d) {
                 scanned.insert(d)
@@ -431,7 +451,6 @@ enum Indexer {
                 }
             }
         } else {
-            cands = apps()
             for r in rootList { cands += walk(r, roots: rootList, onError: { blind.append($0) }) }
         }
         // Other sources have their own cadence: re-read hourly, when a browser's database changed, or on --full.
@@ -461,7 +480,7 @@ enum Indexer {
         }.map(\.key)) : []
         func authoritative(_ p: String, _ o: Old) -> Bool {
             if keepKinds.contains(o.kind) || isBlind(p) { return false }
-            guard incremental, Kind(rawValue: o.kind)?.isFile ?? true else { return true }
+            guard incremental, o.kind != Kind.app.rawValue, Kind(rawValue: o.kind)?.isFile ?? true else { return true }
             if rootList.contains(p), scanned.contains(p) { return true }
             return scanned.contains((p as NSString).deletingLastPathComponent) || inside(p, vanished)
         }

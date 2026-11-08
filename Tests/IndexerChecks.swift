@@ -283,6 +283,51 @@ enum IndexerChecks {
             check("an incremental run leaves folders it was not given alone", fileRow(dir.path + "/outside.txt") != nil && has("OO-7777") && !has("OO-8888"))
             _ = Indexer.run(full: false, paths: nil)
             check("the next full walk catches up", has("OO-8888"))
+
+            // a file's passages are looked up through an index; databases from before it get one when opened
+            var plan = ""
+            Store(readonly: true)?.run("EXPLAIN QUERY PLAN SELECT id FROM content_content WHERE c0=?", [1]) { plan += colText($0, 3) }
+            check("a file's passages are found through an index, not a scan of all stored text", plan.contains("content_file"))
+            let oldDB = dir.appendingPathComponent("v1.sqlite").path
+            Store(path: oldDB)?.exec("DROP INDEX content_file; PRAGMA user_version=1")
+            var upgraded = false
+            _ = Store(path: oldDB)
+            Store(readonly: true, path: oldDB)?.run("SELECT 1 FROM sqlite_master WHERE name='content_file'") { _ in upgraded = true }
+            check("an index made before the passage index gains it when next opened", upgraded)
+            let paths = ["/", "/a", "/a/b.txt", "/a/b/", "/a//b", "rel/x", "https://example.com/x", "clip:123", "/Users/ñandú/Café.pdf", "", "/a/b/c d/e.f"]
+            check("native parent paths match NSString", paths.allSatisfy { parentPath($0) == ($0 as NSString).deletingLastPathComponent })
+            let names = ["Report_V16.PDF", "a.b c", ".pdf", "x..y", "x.-y", "foo.tar.gz", "Mix Ed.Up2", "trailing.", "st. patrick’s day", "README", "Café.pdf", "\u{212A}.txt", "dr. chloé"]
+            check("stem tokens taken from the name's tokens match tokenizing the stem", names.allSatisfy { n in
+                let l = n.lowercased(), stem = (l as NSString).deletingPathExtension
+                return stemTokens(lname: l, stem: stem, nameTokens: nameTokens(n), ascii: l.utf8.allSatisfy { $0 < 0x80 }) == nameTokens(stem)
+            })
+
+            // application folders are listed on every run, not only on full walks
+            do {
+                let savedApps = Indexer.appFolders
+                defer { Indexer.appFolders = savedApps }
+                let apps = dir.appendingPathComponent("apps")
+                let tool = apps.appendingPathComponent("Vendor/Fixture Tool.app").path
+                try fm.createDirectory(atPath: tool + "/Contents", withIntermediateDirectories: true)
+                Indexer.appFolders = [(apps.path, 1)]
+                check("the app watcher reacts to bundles, not to files inside them", Indexer.appEntry(tool) && Indexer.appEntry(apps.path + "/Vendor") &&
+                      !Indexer.appEntry(tool + "/Contents/Info.plist") && !Indexer.appEntry(apps.path + "/.DS_Store") && !Indexer.appEntry("/elsewhere/X.app"))
+                check("the bar's app listing finds an app in a vendor folder", Indexer.appPaths().contains(tool))
+                let before = Store(readonly: true)?.metaString("generation")
+                _ = Indexer.run(full: false, namesOnly: true, paths: [])
+                var kind = -1
+                Store(readonly: true)?.run("SELECT kind FROM files WHERE path=?", [tool]) { kind = Int(sqlite3_column_int($0, 0)) }
+                check("an app installed after the full walk is indexed by a run that lists no folder", kind == Kind.app.rawValue &&
+                      Store(readonly: true)?.metaString("generation") != before)
+                check("an indexed app is no longer reported missing to the bar",
+                      Engine(index: Index.load(vectors: false)).unindexed([tool, apps.path + "/Gone.app"]) == [apps.path + "/Gone.app"])
+                let unchanged = Store(readonly: true)?.metaString("generation")
+                _ = Indexer.run(full: false, namesOnly: true, paths: [])
+                check("an unchanged app listing writes nothing", Store(readonly: true)?.metaString("generation") == unchanged)
+                try fm.removeItem(atPath: tool)
+                _ = Indexer.run(full: false, namesOnly: true, paths: [])
+                check("an uninstalled app leaves the index on the next run", fileRow(tool) == nil)
+            }
         } catch {
             check("indexer fixtures execute without error: \(error.localizedDescription)", false)
         }

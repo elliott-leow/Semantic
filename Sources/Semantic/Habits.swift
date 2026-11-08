@@ -19,6 +19,7 @@ final class Habits {
     private var byKey: [String: [Row]] = [:]
     private var picks: [String: [String: Cell]] = [:]   // normalized query -> key -> decayed count
     private var dirty = Set<Row>()
+    private var stale = Set<Row>()     // rows merged into another at load, deleted from the table at the next flush
     private var dirtyPicks = Set<[String]>()
     private var flushScheduled = false
     private var version = 0
@@ -44,10 +45,13 @@ final class Habits {
         let now = Date().timeIntervalSince1970
         guard let store = Store(readonly: true, path: path) else { return }
         store.run("SELECT key, ctx, hour, w, t FROM habits") { st in
-            let r = Row(key: colText(st, 0), ctx: colText(st, 1), hour: Int(sqlite3_column_int(st, 2)))
+            let raw = Row(key: colText(st, 0), ctx: colText(st, 1), hour: Int(sqlite3_column_int(st, 2)))
             let c = Cell(w: sqlite3_column_double(st, 3), t: sqlite3_column_double(st, 4))
+            // rows learned under a path the app is not indexed by (Safari's cryptex) join the indexed path's row
+            let r = Row(key: Self.indexed(raw.key), ctx: Self.indexed(raw.ctx), hour: raw.hour)
+            if r != raw { self.stale.insert(raw); self.dirty.insert(r) }
             guard Self.decay(c, now) >= 0.01 else { return }
-            self.put(r, c)
+            self.merge(r, c)
         }
         store.run("SELECT q, key, n, t FROM picks") { st in
             self.picks[colText(st, 0), default: [:]][colText(st, 1)] = Cell(w: sqlite3_column_double(st, 2), t: sqlite3_column_double(st, 3))
@@ -59,6 +63,19 @@ final class Habits {
             }
             if !dirty.isEmpty { scheduleFlushLocked() }
         }
+        if !stale.isEmpty { scheduleFlushLocked() }
+    }
+
+    // app keys and contexts as the index spells them; other keys (files, intents, "@app") are left alone
+    static func indexed(_ key: String) -> String {
+        key.hasPrefix("/") && key.hasSuffix(".app") ? Sys.indexedAppPath(key) : key
+    }
+
+    // two rows for one cell: their weights decayed to the later time, added
+    private func merge(_ r: Row, _ c: Cell) {
+        guard let old = cells[r] else { put(r, c); return }
+        let t = max(old.t, c.t)
+        put(r, Cell(w: Self.decay(old, t) + Self.decay(c, t), t: t))
     }
 
     private func put(_ r: Row, _ c: Cell) {
@@ -124,11 +141,16 @@ final class Habits {
         flushScheduled = false
         let rows = dirty.compactMap { r in cells[r].map { (r, $0) } }
         let chosen = dirtyPicks.compactMap { p in picks[p[0]]?[p[1]].map { (p[0], p[1], $0) } }
+        let gone = stale
         dirty.removeAll()
         dirtyPicks.removeAll()
+        stale.removeAll()
         lock.unlock()
-        guard !rows.isEmpty || !chosen.isEmpty, let store = Store(path: path) else { return }
+        guard !rows.isEmpty || !chosen.isEmpty || !gone.isEmpty, let store = Store(path: path) else { return }
         store.exec("BEGIN")
+        for r in gone {
+            store.run("DELETE FROM habits WHERE key=? AND ctx=? AND hour=?", [r.key, r.ctx, r.hour])
+        }
         for (r, c) in rows {
             store.run("INSERT OR REPLACE INTO habits(key, ctx, hour, w, t) VALUES(?,?,?,?,?)", [r.key, r.ctx, r.hour, c.w, c.t])
         }

@@ -44,6 +44,31 @@ enum Sys {
     private static var apps: [String: (URL?, Date)] = [:]
     private static var browser: (String, Date)?
 
+    // The path a running app is indexed under. Safari can report the cryptex that /Applications/Safari.app links
+    // to, and a quarantined app a random translocation folder; habits learned under those paths matched no index
+    // row, so the app was never suggested and was not recognised as the app in front.
+    static func indexedAppPath(_ path: String) -> String {
+        var p = path
+        if p.contains("/AppTranslocation/"), let original = translocationOriginal(p) { p = original }
+        for cryptex in ["/System/Volumes/Preboot/Cryptexes/App", "/System/Cryptexes/App"] where p.hasPrefix(cryptex + "/System/Applications/") {
+            let visible = "/Applications/" + (p as NSString).lastPathComponent
+            if FileManager.default.fileExists(atPath: visible) { p = visible }
+        }
+        if p.hasPrefix("/System/Volumes/Data/") { p.removeFirst("/System/Volumes/Data".count) }
+        return p
+    }
+
+    static func indexedAppPath(_ url: URL?) -> String? { url.map { indexedAppPath($0.path) } }
+
+    // Security.framework's own answer for where a translocated app really lives (SPI, so looked up at run time)
+    private static func translocationOriginal(_ path: String) -> String? {
+        typealias Original = @convention(c) (CFURL, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> Unmanaged<CFURL>?
+        guard let lib = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY),
+              let sym = dlsym(lib, "SecTranslocateCreateOriginalPathForURL") else { return nil }
+        let original = unsafeBitCast(sym, to: Original.self)(URL(fileURLWithPath: path) as CFURL, nil)?.takeRetainedValue() as URL?
+        return original.map(\.path).flatMap { $0.contains("/AppTranslocation/") ? nil : $0 }
+    }
+
     static func app(_ bundleID: String) -> URL? {
         lookupLock.lock()
         if let (u, t) = apps[bundleID], Date().timeIntervalSince(t) < 30 { lookupLock.unlock(); return u }

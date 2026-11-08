@@ -33,6 +33,40 @@ final class Entry {
     }
 }
 
+// NSString.deletingLastPathComponent, as a native string. A plain absolute path (no repeated or trailing slash,
+// which is every file row) is cut at its last slash without the bridge; anything else is left to NSString.
+// A bridged result hashes and compares through Swift's slow Unicode path, which made it most of a reload.
+func parentPath(_ p: String) -> String {
+    var p = p
+    let fast: String? = p.withUTF8 { b in
+        let n = b.count, slash = UInt8(ascii: "/")
+        guard n > 1, b[0] == slash, b[n - 1] != slash else { return nil }
+        var last = 0
+        for i in 1..<n where b[i] == slash {
+            if b[i - 1] == slash { return nil }
+            last = i
+        }
+        return last == 0 ? "/" : String(decoding: UnsafeBufferPointer(rebasing: b[..<last]), as: UTF8.self)
+    }
+    if let fast { return fast }
+    var out = (p as NSString).deletingLastPathComponent
+    out.makeContiguousUTF8()
+    return out
+}
+
+// nameTokens(stem) from the name's own tokens. An ASCII name is the stem, a dot and an alphanumeric extension,
+// which the tokenizer reads as the stem's tokens plus one; anything else is tokenized again.
+func stemTokens(lname: String, stem: String, nameTokens toks: [String], ascii: Bool) -> [String] {
+    guard ascii else { return nameTokens(stem) }
+    let n = lname.utf8.count, k = stem.utf8.count
+    if k == n { return toks }
+    var l = lname
+    let plain = l.withUTF8 { b in
+        k + 1 < n && b[k] == UInt8(ascii: ".") && b[(k + 1)...].allSatisfy { $0 &- 97 < 26 || $0 &- 48 < 10 }
+    }
+    return plain && !toks.isEmpty ? Array(toks.dropLast()) : nameTokens(stem)
+}
+
 // Snapshot of the index: entries plus one int8 matrix of vectors. Only the engine queue appends rows.
 final class Index {
     var entries: [Entry] = []
@@ -70,23 +104,29 @@ final class Index {
     func loadMetadata(_ store: Store) {
         var ids: [Int64: Int] = [:], parents = Set<String>()
         var folderTokens: [String: (String, [String], Bool)] = [:]  // files in one folder share its tokens
-        store.run("SELECT id,path,name,kind,mtime,size,snippet FROM files ORDER BY id") { [self] st in
+        // snippets are kept only for kinds that are not files (see Entry.snippet), so file rows skip reading theirs
+        store.run("SELECT id,path,name,kind,mtime,size,CASE WHEN kind > ? THEN snippet ELSE '' END FROM files ORDER BY id", [Kind.folder.rawValue]) { [self] st in
             let name = colText(st, 2), path = colText(st, 1)
             let kind = Kind(rawValue: Int(sqlite3_column_int(st, 3))) ?? .other
             let toks = nameTokens(name), size = Int(sqlite3_column_int64(st, 5))
-            let ext = kind.isFile ? (name as NSString).pathExtension.lowercased() : ""
             let lname = name.lowercased(), lpath = path.lowercased()
-            // NSString results are bridged; a native copy compares several times faster
-            var stem = (lname as NSString).deletingPathExtension
-            stem.makeContiguousUTF8()
-            let stemToks = nameTokens(stem)
-            var base = (name as NSString).deletingPathExtension.lowercased()
+            // Extensions follow NSString's rules (a "." followed by a space is no extension); a name without
+            // a dot has none, and skips the bridge. Bridged results are copied: a native string hashes and
+            // compares several times faster.
+            let dotted = name.utf8.contains(UInt8(ascii: "."))
+            let ext = kind.isFile && dotted ? (name as NSString).pathExtension.lowercased() : ""
+            var stem = lname
+            if dotted { stem = (lname as NSString).deletingPathExtension; stem.makeContiguousUTF8() }
+            let ascii = lname.utf8.allSatisfy { $0 < 0x80 }
+            let stemToks = stemTokens(lname: lname, stem: stem, nameTokens: toks, ascii: ascii)
+            // the name without its extension, lowercased: the same as the stem
+            var base = stem
             // a match ends in ")" or holds "copy"; most names have neither
             if base.utf8.contains(0x29) || Engine.bytesContain(base, "copy") {
                 base = Rx.replace(base, "(\\s*\\(\\d+\\)|\\s+copy(\\s+\\d+)?)+$", "")
             }
             // Do not collapse numbered chapters or unrelated same-size files in other folders.
-            let parent = (path as NSString).deletingLastPathComponent
+            let parent = parentPath(path)
             // String keys compare canonically; reuse only for the very same bytes
             let (ptoks, pascii) = folderTokens[parent].flatMap { $0.0.utf8.elementsEqual(parent.utf8) ? ($0.1, $0.2) : nil } ?? {
                 let t = nameTokens(parent), ascii = t.allSatisfy { $0.utf8.allSatisfy { $0 < 0x80 } }
@@ -99,13 +139,13 @@ final class Index {
             if kind == .folder { folders.insert(lname) }
             if kind.isFile {
                 names.insert(lname); names.insert(stem); lpaths.insert(lpath)
-                let lparent = (lpath as NSString).deletingLastPathComponent
+                let lparent = parentPath(lpath)
                 if parents.insert(lparent).inserted {
                     for c in lparent.split(separator: "/") { dirs.insert(String(c)) }
                 }
             }
             entries.append(Entry(path: path, name: name, lname: lname, stem: stem, words: stemToks.filter { !stopwords.contains($0) },
-                                 stemCount: stemToks.count, ascii: lname.utf8.allSatisfy { $0 < 0x80 }, pathTokens: ptoks, pathAscii: pascii, lpath: lpath, tokens: toks,
+                                 stemCount: stemToks.count, ascii: ascii, pathTokens: ptoks, pathAscii: pascii, lpath: lpath, tokens: toks,
                                  initials: String(toks.compactMap(\.first)), kind: kind,
                                  mtime: sqlite3_column_double(st, 4), size: size, ext: ext,
                                  snippet: kind.isFile ? "" : colText(st, 6), dupKey: dup))
@@ -399,6 +439,12 @@ final class Engine {
     private func boosts(_ q: String) -> [String: Float] { learning ? Habits.shared.boosts(q) : [:] }
 
     func indexed(_ key: String) -> Bool { locked { index.byPath[key] != nil } }
+
+    // Those of `paths` without a row, in file search's copy of the index (current as soon as metadata is read,
+    // without waiting for vectors). Blocks on that queue, so never call it from there.
+    func unindexed(_ paths: [String]) -> [String] {
+        quickQueue.sync { let ix = quickIndex; return paths.filter { ix.byPath[$0] == nil } }
+    }
 
     // Before anything is typed: what habit says is wanted now (time of day, the app in front, recency).
     // Only things still present in the index are offered, so a deleted file or app quietly drops out.

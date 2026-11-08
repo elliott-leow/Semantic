@@ -4,6 +4,8 @@ import AppKit
 private enum Watch {
     static var dirs = Set<String>()   // folders with changed entries since the last run started
     static var rescan = false         // FSEvents lost track (dropped events, root moved): walk everything
+    static var apps = false           // an application folder changed since the last run started
+    static var missingApps: [String] = [] // apps on disk but not in the index, as of the last time the bar was opened
     static var timer: Timer?          // the one pending debounce
     static var roots: [String] = []
     static var home: DispatchSourceFileSystemObject?
@@ -52,6 +54,7 @@ extension AppDelegate {
         }
         Watch.dirs.removeAll()
         Watch.rescan = false
+        Watch.apps = false // every run lists the application folders
         lastIndexRun = Date()
         let p = Process()
         p.executableURL = URL(fileURLWithPath: exe)
@@ -66,12 +69,19 @@ extension AppDelegate {
                 // a run cut short may have written rows without bumping the generation
                 self.reloadIndex(ifChanged: p.terminationReason == .exit && p.terminationStatus == 0, deferIfHidden: true)
                 if self.pendingIndex { self.pendingIndex = false; self.startIndexer() }
-                else if Watch.rescan || !Watch.dirs.isEmpty { self.scheduleChangedRun() }
+                else if Watch.rescan || !Watch.dirs.isEmpty || Watch.apps { self.scheduleChangedRun() }
             }
         }
         guard (try? p.run()) != nil else { return }
         indexer = p
         ticks = 0
+        // names are published within a fraction of a second; an open bar picks them up before the first tick
+        for delay in [0.4, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.indexer === p else { return }
+                self.reloadIndex(ifChanged: true, deferIfHidden: true)
+            }
+        }
         progressTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             if Watch.store == nil { Watch.store = Store(readonly: true) }
             guard let self, let s = Watch.store?.metaString("progress") else { return }
@@ -102,22 +112,53 @@ extension AppDelegate {
         if Watch.dirty { reloadIndex() }
     }
 
-    // One debounce for every batch of events: at least 5 s, and runs start at most once a minute.
+    // One debounce for every batch of events while the bar is hidden: at least 5 s, and runs start at most
+    // once a minute. While it is open someone is waiting to find what just changed, so runs start at once.
     private func scheduleChangedRun() {
+        if bar.isVisible { runChanged(); return }
         guard Watch.timer == nil else { return }
         let wait = max(5, 60 - Date().timeIntervalSince(lastIndexRun))
         Watch.timer = Timer.scheduledTimer(withTimeInterval: wait, repeats: false) { [weak self] _ in
             Watch.timer = nil
-            guard let self, self.indexer == nil else { return } // the termination handler reschedules
-            if Watch.rescan || Watch.dirs.count > Watch.maxDirs { self.startIndexer() }
-            else if !Watch.dirs.isEmpty { self.startIndexer(paths: Watch.dirs.sorted()) }
+            self?.runChanged()
         }
     }
 
-    fileprivate func filesChanged(_ dirs: [String], rescan: Bool) {
+    // the pending changes, now; an app change alone lists the application folders and no other folder
+    private func runChanged() {
+        Watch.timer?.invalidate()
+        Watch.timer = nil
+        guard indexer == nil else { return } // the termination handler reschedules
+        if Watch.rescan || Watch.dirs.count > Watch.maxDirs { startIndexer() }
+        else if !Watch.dirs.isEmpty || Watch.apps { startIndexer(paths: Watch.dirs.sorted()) }
+    }
+
+    // The bar was just opened. Events FSEvents is still holding back (its 5 s latency) are delivered, changes
+    // waiting on the debounce start now, and the application folders are listed again: an app installed since
+    // the last run starts one even if no file event was seen. Only folders known to have changed are listed,
+    // so this costs a few directory reads however large the index is.
+    func catchUp() {
+        if let s = stream { FSEventStreamFlushAsync(s) }
+        if Watch.rescan || !Watch.dirs.isEmpty || Watch.apps { runChanged() }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let missing = Engine.shared.unindexed(Indexer.appPaths())
+            DispatchQueue.main.async {
+                // once per new set, so an app the indexer cannot add does not start a run on every show
+                guard missing != Watch.missingApps else { return }
+                Watch.missingApps = missing
+                guard !missing.isEmpty else { return }
+                log("not yet indexed: \(missing.map { ($0 as NSString).lastPathComponent }.joined(separator: ", "))")
+                Watch.apps = true
+                self.runChanged()
+            }
+        }
+    }
+
+    fileprivate func filesChanged(_ dirs: [String], rescan: Bool, apps: Bool) {
         if rescan { Watch.rescan = true }
+        if apps { Watch.apps = true }
         Watch.dirs.formUnion(dirs)
-        if Watch.rescan || !Watch.dirs.isEmpty { scheduleChangedRun() }
+        if Watch.rescan || !Watch.dirs.isEmpty || Watch.apps { scheduleChangedRun() }
     }
 
     func watchFiles() {
@@ -135,10 +176,12 @@ extension AppDelegate {
             let list = unsafeBitCast(paths, to: NSArray.self) as? [String] ?? []
             let lost = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped |
                                                kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagRootChanged)
-            var dirs: [String] = [], rescan = false
+            var dirs: [String] = [], rescan = false, apps = false
             for i in 0..<min(n, list.count) {
                 if flags[i] & lost != 0 { rescan = true; continue }
                 let p = list[i]
+                // an app installed, removed or replaced; churn inside a bundle (updaters, caches) is not
+                if Indexer.appEntry(p) { apps = true }
                 // a file event names the item; its folder is what gets listed again
                 guard !Indexer.ignorable(p, roots: Watch.roots) else { continue }
                 let dir = (p as NSString).deletingLastPathComponent
@@ -150,10 +193,12 @@ extension AppDelegate {
                 }
                 dirs.append(Watch.roots.contains(p) ? p : dir)
             }
-            AppDelegate.shared?.filesChanged(dirs, rescan: rescan)
+            AppDelegate.shared?.filesChanged(dirs, rescan: rescan, apps: apps)
         }
         let flags = kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents
-        guard let s = FSEventStreamCreate(nil, cb, nil, roots as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 5,
+        // the writable application folders too (the system ones change only with macOS updates)
+        let watched = roots + Indexer.appFolders.map(\.dir).filter { !$0.hasPrefix("/System/") && FileManager.default.fileExists(atPath: $0) }
+        guard let s = FSEventStreamCreate(nil, cb, nil, watched as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 5,
                                           FSEventStreamCreateFlags(flags)) else { return }
         FSEventStreamSetDispatchQueue(s, .main)
         FSEventStreamStart(s)

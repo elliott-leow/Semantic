@@ -6,7 +6,7 @@ private let TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 final class Store {
     private var db: OpaquePointer?
     private let writable: Bool
-    static let schema: Int32 = 1
+    static let schema: Int32 = 2
     private static let optimizeLock = NSLock()
     private static var optimized = 0.0
     private var statements: [String: OpaquePointer] = [:]
@@ -47,6 +47,9 @@ final class Store {
         add("files", "textIndexed", "INT DEFAULT 0")
         add("files", "sourceRevision", "TEXT DEFAULT ''")
         add("vecs", "loc", "REAL DEFAULT 0")
+        // 2: a file's passages are found through this index. FTS5 keeps file_id in its content table
+        // without one, so every delete or re-read of one file's text scanned all stored text (hundreds of MB).
+        exec("CREATE INDEX IF NOT EXISTS content_file ON content_content(c0)")
         exec("PRAGMA user_version=\(Self.schema)")
     }
 

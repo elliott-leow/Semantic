@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 
 // App-first ranking and learning from what is picked. Runs last: it teaches Habits.shared.
 enum HabitChecks {
@@ -103,6 +104,31 @@ enum HabitChecks {
         let reloaded = Habits(path: root.appendingPathComponent("habits-only.sqlite").path)
         reloaded.setContext("/a/Code.app")
         check("learned habits survive a restart", abs((reloaded.prior(now: now)["/a/Terminal.app"] ?? 0) - (model.prior(now: now)["/a/Terminal.app"] ?? 0)) < 0.01)
+
+        // running apps are keyed by the path they are indexed under
+        check("a firmlinked or plain app path keeps the path it is indexed by",
+              Sys.indexedAppPath("/System/Volumes/Data/Applications/X.app") == "/Applications/X.app" && Sys.indexedAppPath("/Applications/X.app") == "/Applications/X.app" &&
+              Sys.indexedAppPath("/Users/me/Downloads/Tool.app") == "/Users/me/Downloads/Tool.app")
+        let cryptex = "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app", safari = "/Applications/Safari.app"
+        if FileManager.default.fileExists(atPath: safari) {
+            check("Safari's cryptex path maps to /Applications/Safari.app", Sys.indexedAppPath(cryptex) == safari)
+            // rows an earlier version learned under the cryptex path join Safari's own, once
+            let splitPath = root.appendingPathComponent("habits-split.sqlite").path, refPath = root.appendingPathComponent("habits-ref.sqlite").path
+            let split = Habits(path: splitPath), ref = Habits(path: refPath)
+            split.recordActivation(cryptex, from: nil, now: now)
+            split.recordActivation(safari, from: cryptex, now: now)
+            ref.recordActivation(safari, from: nil, now: now)
+            ref.recordActivation(safari, from: safari, now: now)
+            split.flush(); ref.flush()
+            let merged = Habits(path: splitPath)
+            let mp = merged.prior(now: now), rp = Habits(path: refPath).prior(now: now)
+            check("habits learned under Safari's cryptex path count for Safari", mp[cryptex] == nil && abs((mp[safari] ?? 0) - (rp[safari] ?? 0)) < 0.001 && (mp[safari] ?? 0) > 0)
+            merged.flush()
+            var stale = -1
+            Store(readonly: true, path: splitPath)?.run("SELECT count(*) FROM habits WHERE key=? OR ctx=?", [cryptex, cryptex]) { stale = Int(sqlite3_column_int($0, 0)) }
+            check("the merged rows are rewritten once, not counted again at the next start", stale == 0 &&
+                  abs((Habits(path: splitPath).prior(now: now)[safari] ?? 0) - (mp[safari] ?? 0)) < 0.001)
+        }
         return results
     }
 }

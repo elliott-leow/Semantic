@@ -91,6 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reloadIfDirty()
         Engine.shared.warm()
         bar.show()
+        catchUp() // after the reload above: it compares against the index that reload loads
     }
 
     // Calendar and Contacts are asked for once; the indexer only reads what was granted
@@ -109,7 +110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func watchApps() {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
             guard let self, let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-                  app != NSRunningApplication.current, let path = app.bundleURL?.path else { return }
+                  app != NSRunningApplication.current, let path = Sys.indexedAppPath(app.bundleURL) else { return }
             let now = Date()
             if let prev = self.frontApp, now.timeIntervalSince(prev.since) >= 3 {
                 Habits.shared.recordActivation(prev.path, from: self.settledApp)
@@ -235,7 +236,9 @@ if let i = args.firstIndex(of: "--calc") {
 }
 if args.contains("--eval") {
     // replays what was picked for past queries and reports how highly the current ranking puts it
-    exit(RankingEval.run(verbose: args.contains("--verbose")))
+    let rc = RankingEval.run(verbose: args.contains("--verbose"))
+    fflush(stdout)
+    _exit(rc) // exit() runs static destructors, and Metal asserts on the model context still alive
 }
 if args.contains("--suggest") {
     // debugging aid: what the empty bar would offer now, and the habit strength behind each row
